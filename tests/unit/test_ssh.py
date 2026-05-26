@@ -37,10 +37,18 @@ from synology_mcp.transport.ssh import DSMSshClient, SshResult
 # ---------------------------------------------------------------------------
 
 
-def _seed_session(app_ctx) -> None:
+def _seed_session(app_ctx, user: str = "testuser") -> None:
+    """Seed the cached DSMSession so call_dsm + _check_calling_user work.
+
+    ``user`` defaults to "testuser" (matches the test_host_cfg account).
+    Tests that exercise the per-user SSH write tools and pass a
+    specific target user MUST override this with the same value so the
+    cross-user gate (gap-fix 2026-05-26) doesn't refuse the call before
+    the actual scenario fires.
+    """
     state = app_ctx.cache.get("testhost")
     state.session = DSMSession(
-        sid="FAKE_SID", syno_token="FAKE_TOKEN", user="testuser",
+        sid="FAKE_SID", syno_token="FAKE_TOKEN", user=user,
         cookies={"id": "FAKE_SID"},
     )
 
@@ -145,7 +153,7 @@ def _decode_payload(commands: list[str]) -> str | None:
 @pytest.mark.asyncio
 async def test_add_authorized_key_happy_path(app_ctx, fixture_json) -> None:
     """Empty authorized_keys + valid pubkey → key appended, exact payload sent."""
-    _seed_session(app_ctx)
+    _seed_session(app_ctx, user="alice")
     home_payload = fixture_json("user_home", "get_enabled.json")
     pubkey_line, fp, _ = _make_pubkey(b"A", comment="alice@ws")
 
@@ -196,7 +204,7 @@ async def test_add_authorized_key_idempotent_when_already_present(
     app_ctx, fixture_json,
 ) -> None:
     """Same fingerprint already in file → added=False, no write happens."""
-    _seed_session(app_ctx)
+    _seed_session(app_ctx, user="bob")
     home_payload = fixture_json("user_home", "get_enabled.json")
     pubkey_line, fp, _ = _make_pubkey(b"B", comment="bob@ws")
     # Existing file has the SAME key but with a DIFFERENT comment — the
@@ -233,7 +241,7 @@ async def test_add_authorized_key_pre_flight_refusal_when_user_home_disabled(
     app_ctx, fixture_json,
 ) -> None:
     """User Home tri-check returns enabled=False → precondition refusal, no SSH writes."""
-    _seed_session(app_ctx)
+    _seed_session(app_ctx, user="carol")
     home_payload = fixture_json("user_home", "get_disabled.json")
     pubkey_line, _, _ = _make_pubkey(b"C")
 
@@ -267,7 +275,7 @@ async def test_add_authorized_key_pre_flight_refusal_when_user_home_disabled(
 @pytest.mark.asyncio
 async def test_add_authorized_key_dsm_403_on_user_home_propagates(app_ctx) -> None:
     """DSM 403 on user_home_is_enabled → call surfaces as PermissionDenied (OTP-required also maps here)."""
-    _seed_session(app_ctx)
+    _seed_session(app_ctx, user="dave")
     pubkey_line, _, _ = _make_pubkey(b"D")
     # DSM 403 -> OtpRequired is the canonical mapping in errors.py; the
     # tool layer lets it bubble (server.py wraps it via _safe).
@@ -291,8 +299,12 @@ async def test_add_authorized_key_dsm_403_on_user_home_propagates(app_ctx) -> No
 
 @pytest.mark.asyncio
 async def test_add_authorized_key_rejects_malformed_pubkey(app_ctx) -> None:
-    """Garbage pubkey → InvalidParam, no DSM/SSH calls."""
-    _seed_session(app_ctx)
+    """Garbage pubkey → InvalidParam, no DSM/SSH calls.
+
+    Pubkey validation happens before the cross-user gate, so the
+    session-seeded user does not need to match the target user here.
+    """
+    _seed_session(app_ctx, user="alice")
     fake_ssh = _fake_ssh()
     app_ctx.cache.get("testhost").ssh_client = fake_ssh
     # Test cases: empty, wrong number of fields, unknown type, bad base64.
@@ -331,7 +343,7 @@ async def test_add_authorized_key_appends_to_existing_file(
     app_ctx, fixture_json,
 ) -> None:
     """Two existing keys + a new one → file contains all three in order."""
-    _seed_session(app_ctx)
+    _seed_session(app_ctx, user="alice")
     home_payload = fixture_json("user_home", "get_enabled.json")
     old1, _, _ = _make_pubkey(b"X", comment="x@host")
     old2, _, _ = _make_pubkey(b"Y", comment="y@host")
@@ -374,7 +386,7 @@ async def test_add_authorized_key_appends_to_existing_file(
 @pytest.mark.asyncio
 async def test_remove_authorized_key_happy_path(app_ctx) -> None:
     """3 keys, remove the middle one → 2 keys, order preserved."""
-    _seed_session(app_ctx)
+    _seed_session(app_ctx, user="alice")
     line1, _, _ = _make_pubkey(b"1", comment="one")
     line2, fp2, _ = _make_pubkey(b"2", comment="two")
     line3, _, _ = _make_pubkey(b"3", comment="three")
@@ -410,7 +422,7 @@ async def test_remove_authorized_key_happy_path(app_ctx) -> None:
 @pytest.mark.asyncio
 async def test_remove_authorized_key_idempotent_when_missing(app_ctx) -> None:
     """Fingerprint not present → removed_count=0 and NO write happens."""
-    _seed_session(app_ctx)
+    _seed_session(app_ctx, user="alice")
     line1, fp1, _ = _make_pubkey(b"K")
     _, fp_missing, _ = _make_pubkey(b"M")
     existing = f"{line1}\n"
@@ -441,7 +453,7 @@ async def test_remove_authorized_key_idempotent_when_missing(app_ctx) -> None:
 @pytest.mark.asyncio
 async def test_remove_authorized_key_preserves_garbage_lines(app_ctx) -> None:
     """Unparseable lines + the target key → garbage lines preserved untouched."""
-    _seed_session(app_ctx)
+    _seed_session(app_ctx, user="alice")
     line1, _, _ = _make_pubkey(b"P", comment="keeper")
     line2, fp2, _ = _make_pubkey(b"Q", comment="remove-me")
     # Garbage we should not silently drop.
@@ -475,7 +487,7 @@ async def test_remove_authorized_key_accepts_bare_or_prefixed_fingerprint(
     app_ctx,
 ) -> None:
     """Both 'SHA256:<b64>' and bare '<b64>' fingerprints are accepted."""
-    _seed_session(app_ctx)
+    _seed_session(app_ctx, user="alice")
     line, fp, _ = _make_pubkey(b"R")
     bare_fp = fp.split(":", 1)[1]  # strip SHA256: prefix
 
@@ -493,8 +505,12 @@ async def test_remove_authorized_key_accepts_bare_or_prefixed_fingerprint(
 
 @pytest.mark.asyncio
 async def test_remove_authorized_key_rejects_malformed_fingerprint(app_ctx) -> None:
-    """Empty / MD5-style / wrong-length / bad-base64 → InvalidParam, no SSH."""
-    _seed_session(app_ctx)
+    """Empty / MD5-style / wrong-length / bad-base64 → InvalidParam, no SSH.
+
+    Fingerprint validation happens before the cross-user gate, so the
+    session-seeded user does not need to match the target user here.
+    """
+    _seed_session(app_ctx, user="alice")
     fake_ssh = _fake_ssh()
     app_ctx.cache.get("testhost").ssh_client = fake_ssh
     bad = [
@@ -521,7 +537,7 @@ async def test_remove_authorized_key_rejects_malformed_fingerprint(app_ctx) -> N
 @pytest.mark.asyncio
 async def test_enable_user_ssh_happy_path(app_ctx, fixture_json) -> None:
     """User is NOT admin → admin_check then add → added=True."""
-    _seed_session(app_ctx)
+    _seed_session(app_ctx, user="bob")
     check_body = fixture_json("group_member", "admin_check_no.json")
     add_body = fixture_json("group_member", "add_success.json")
     with respx.mock(base_url="https://192.0.2.10:5001") as mock:
@@ -558,7 +574,7 @@ async def test_enable_user_ssh_idempotent_already_admin(
     app_ctx, fixture_json,
 ) -> None:
     """User IS admin → admin_check returns True → no add call, 'already enabled' warning."""
-    _seed_session(app_ctx)
+    _seed_session(app_ctx, user="alice")
     check_body = fixture_json("group_member", "admin_check_yes.json")
     with respx.mock(base_url="https://192.0.2.10:5001") as mock:
         route = mock.get("/webapi/entry.cgi").respond(200, json=check_body)
@@ -578,7 +594,7 @@ async def test_enable_user_ssh_accepts_flat_admin_check_shape(
     app_ctx, fixture_json,
 ) -> None:
     """Older DSM shape: data.is_admin=true (no users[] wrapper)."""
-    _seed_session(app_ctx)
+    _seed_session(app_ctx, user="alice")
     check_body = fixture_json("group_member", "admin_check_flat.json")
     with respx.mock(base_url="https://192.0.2.10:5001") as mock:
         mock.get("/webapi/entry.cgi").respond(200, json=check_body)
@@ -592,7 +608,7 @@ async def test_enable_user_ssh_accepts_flat_admin_check_shape(
 @pytest.mark.asyncio
 async def test_enable_user_ssh_dsm_403_permission_denied(app_ctx) -> None:
     """DSM 105 on admin_check → PermissionDenied bubbles."""
-    _seed_session(app_ctx)
+    _seed_session(app_ctx, user="alice")
     err_body = {"success": False, "error": {"code": 105}}
     with respx.mock(base_url="https://192.0.2.10:5001") as mock:
         mock.get("/webapi/entry.cgi").respond(200, json=err_body)
@@ -605,7 +621,7 @@ async def test_enable_user_ssh_dsm_403_permission_denied(app_ctx) -> None:
 @pytest.mark.asyncio
 async def test_enable_user_ssh_dsm_119_force_relogin_propagates(app_ctx) -> None:
     """DSM 119 → SessionFailed bubbles (transport layer maps the code)."""
-    _seed_session(app_ctx)
+    _seed_session(app_ctx, user="alice")
     err_body = {"success": False, "error": {"code": 119}}
     with respx.mock(base_url="https://192.0.2.10:5001") as mock:
         mock.get("/webapi/entry.cgi").respond(200, json=err_body)
@@ -623,8 +639,11 @@ async def test_enable_user_ssh_rejects_malformed_username(app_ctx) -> None:
     that would respond if it were ever called; if validation works
     correctly the route is never matched and the bare ``assert
     route.called is False`` confirms no DSM call was attempted.
+
+    Username validation happens before the cross-user gate, so the
+    session-seeded user does not need to match here.
     """
-    _seed_session(app_ctx)
+    _seed_session(app_ctx, user="testuser")
     with respx.mock(
         base_url="https://192.0.2.10:5001", assert_all_called=False,
     ) as mock:
@@ -637,6 +656,88 @@ async def test_enable_user_ssh_rejects_malformed_username(app_ctx) -> None:
                     "testhost", bad_user, app_context=app_ctx,
                 )
         assert route.called is False
+
+
+# ===========================================================================
+# Cross-user gate (Phase 3 gap-fix 2026-05-26)
+# ===========================================================================
+#
+# Cross-user SSH writes (target_user != session.user) need sudo on every
+# host where DSM gives each user's home a 0700 mode owned by that user.
+# The MCP refuses those calls early with
+# ``category=cross_user_not_supported`` so the caller gets a structured
+# error instead of a hard ``DSMSshError`` deep in the write path.
+
+
+@pytest.mark.asyncio
+async def test_add_authorized_key_refuses_cross_user(
+    app_ctx, fixture_json,
+) -> None:
+    """target_user != session.user -> category=cross_user_not_supported, no SSH writes."""
+    _seed_session(app_ctx, user="alice")  # calling as alice
+    pubkey_line, _, _ = _make_pubkey(b"X")
+    fake_ssh = _fake_ssh(_user_home_enabled_routes())
+    app_ctx.cache.get("testhost").ssh_client = fake_ssh
+
+    with respx.mock(
+        base_url="https://192.0.2.10:5001", assert_all_called=False,
+    ) as mock:
+        route = mock.get("/webapi/entry.cgi").respond(
+            200, json={"success": True, "data": {}},
+        )
+        result = await ssh.ssh_add_authorized_key(
+            "testhost", "bob", pubkey_line, app_context=app_ctx,
+        )
+
+    assert result["ok"] is False
+    assert result["data"]["category"] == "cross_user_not_supported"
+    assert result["data"]["target_user"] == "bob"
+    assert result["data"]["calling_user"] == "alice"
+    assert "NOPASSWD sudo" in result["data"]["next_step"]
+    # No SSH writes — the gate fires before mkdir/cat/printf.
+    assert not any("mkdir -p" in c for c in fake_ssh.commands)
+    assert _decode_payload(fake_ssh.commands) is None
+    # No User.Home.get DSM call either — gate fires before that too.
+    assert route.called is False
+
+
+@pytest.mark.asyncio
+async def test_remove_authorized_key_refuses_cross_user(app_ctx) -> None:
+    """remove against another user -> cross_user_not_supported, no SSH side-effects."""
+    _seed_session(app_ctx, user="alice")
+    _, fp, _ = _make_pubkey(b"Y")
+    fake_ssh = _fake_ssh()
+    app_ctx.cache.get("testhost").ssh_client = fake_ssh
+    result = await ssh.ssh_remove_authorized_key(
+        "testhost", "bob", fp, app_context=app_ctx,
+    )
+    assert result["ok"] is False
+    assert result["data"]["category"] == "cross_user_not_supported"
+    assert result["data"]["target_user"] == "bob"
+    assert result["data"]["calling_user"] == "alice"
+    # No SSH commands at all.
+    assert fake_ssh.commands == []
+
+
+@pytest.mark.asyncio
+async def test_enable_user_ssh_refuses_cross_user(app_ctx) -> None:
+    """enable against another user -> cross_user_not_supported, no DSM calls."""
+    _seed_session(app_ctx, user="alice")
+    with respx.mock(
+        base_url="https://192.0.2.10:5001", assert_all_called=False,
+    ) as mock:
+        route = mock.get("/webapi/entry.cgi").respond(
+            200, json={"success": True, "data": {}},
+        )
+        result = await ssh.ssh_enable_user_ssh(
+            "testhost", "bob", app_context=app_ctx,
+        )
+    assert result["ok"] is False
+    assert result["data"]["category"] == "cross_user_not_supported"
+    assert result["data"]["target_user"] == "bob"
+    assert result["data"]["calling_user"] == "alice"
+    # No DSM admin_check fired.
+    assert route.called is False
 
 
 # ===========================================================================

@@ -40,6 +40,7 @@ from typing import Any
 
 from . import user_home as _user_home
 from ._helpers import call_dsm, get_ssh_client, success_envelope
+from .auth import ensure_session
 from .errors import DSMSshError, InvalidParam
 from .transport.http import extract_warnings
 from .transport.ssh import DSMSshClient
@@ -313,6 +314,80 @@ def _join_authorized_keys(entries: list[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Calling-user constraint (Phase 3 gap-fix 2026-05-26)
+# ---------------------------------------------------------------------------
+#
+# Cross-user SSH writes (add/remove/enable against a target_user that
+# is NOT the calling DSM account) need sudo on every host where DSM
+# gives each user's home a 0700 mode owned by that user:
+#
+#   * ``ssh_add_authorized_key`` / ``ssh_remove_authorized_key`` —
+#     ``mkdir -p /var/services/homes/<target>/.ssh`` fails for the
+#     calling account because the parent home dir is 0700 owned by
+#     the target user.
+#   * ``ssh_enable_user_ssh`` — DSM 7.3 routes this through
+#     ``SYNO.Core.Group.Member add`` which requires admin privileges.
+#     For consistency we apply the same constraint here.
+#
+# Until a sudo-password mechanism is on the table (out of scope for
+# this gap-fix pass per the strict-first rule), we refuse cross-user
+# requests with ``category=cross_user_not_supported`` and explain the
+# constraint in next_step. Same-user requests (target == session.user)
+# remain fully supported — which is the only path we have a clean,
+# tested live integration for anyway.
+
+
+async def _check_calling_user(
+    host: str, target_user: str, *, app_context,
+) -> dict | None:
+    """Refuse cross-user requests; return None when target == session.user.
+
+    Returns a refusal envelope dict (ok=False, category=...) when the
+    target_user is different from the DSM account this MCP is
+    authenticated as. Returns None on a match — the caller then
+    proceeds with the normal flow.
+
+    Ensures a session exists first (uses :func:`ensure_session` —
+    same path the DSM HTTP transport uses) so we can pull the user
+    name from the cached session regardless of whether the host was
+    just bootstrapped.
+    """
+    host_cfg = app_context.config.get_host(host)
+    if not host_cfg.password:
+        # No password means we can't authenticate at all — let the
+        # downstream call surface that as a ConfigError. Don't refuse
+        # the cross-user check on a missing-cred path.
+        return None
+    session = await ensure_session(
+        host_cfg,
+        app_context.cache,
+        password=host_cfg.password,
+        otp_code=host_cfg.otp_code,
+    )
+    calling_user = session.user
+    if calling_user == target_user:
+        return None
+    return {
+        "ok": False,
+        "host": host,
+        "data": {
+            "category": "cross_user_not_supported",
+            "target_user": target_user,
+            "calling_user": calling_user,
+            "next_step": (
+                "this MCP currently supports SSH-key writes only for the "
+                "calling DSM account (NOPASSWD sudo would be needed to "
+                "write to other users' .ssh/ directories, and that is "
+                "not yet configurable). If you need cross-user writes, "
+                "do it via DSM Control Panel or arrange sudo manually "
+                "for now."
+            ),
+        },
+        "warnings": [],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Tool: ssh_add_authorized_key
 # ---------------------------------------------------------------------------
 
@@ -333,10 +408,23 @@ async def ssh_add_authorized_key(
 
     File transport: base64-encoded payload over ``exec_command``. NO
     SFTP — DSM disables the SFTP subsystem by default.
+
+    Cross-user constraint (Phase 3 gap-fix 2026-05-26): this tool now
+    refuses when ``user`` differs from the DSM account this MCP is
+    authenticated as. DSM gives each user's home a 0700 mode owned by
+    the target user, so an ``mkdir`` from the calling account into a
+    different user's ``~/.ssh`` fails. The previous behaviour was a
+    hard ``DSMSshError`` deep in the write path; we now refuse early
+    with ``category=cross_user_not_supported`` and a clear next_step.
     """
     _validate_username(user, host=host)
     key_type, key_bytes, embedded_comment = _parse_pubkey(pubkey, host=host)
     fingerprint = _fingerprint_sha256(key_bytes)
+
+    # Cross-user gate (gap 2026-05-26): see _check_calling_user docstring.
+    refusal = await _check_calling_user(host, user, app_context=app_context)
+    if refusal is not None:
+        return refusal
 
     # Pre-flight: confirm User Home is genuinely enabled.
     home_envelope = await _user_home.user_home_is_enabled(
@@ -434,9 +522,20 @@ async def ssh_remove_authorized_key(
     keys is preserved exactly. Lines we can't parse (garbage, custom
     options, etc.) are preserved untouched — we never silently rewrite
     state we don't understand.
+
+    Cross-user constraint (Phase 3 gap-fix 2026-05-26): same as
+    :func:`ssh_add_authorized_key` — refuses when ``user`` differs
+    from the calling DSM account with
+    ``category=cross_user_not_supported``.
     """
     _validate_username(user, host=host)
     target_fp = _normalize_fingerprint(fingerprint)
+
+    # Cross-user gate (gap 2026-05-26): see _check_calling_user docstring.
+    refusal = await _check_calling_user(host, user, app_context=app_context)
+    if refusal is not None:
+        return refusal
+
     ssh = get_ssh_client(app_context, host)
     existing_blob = await _read_authorized_keys(ssh, user)
     existing_entries = _split_authorized_keys(existing_blob)
@@ -507,8 +606,24 @@ async def ssh_enable_user_ssh(
     Idempotent: if ``admin_check`` says the user is already an admin,
     returns ``ok=True`` with ``warnings=["already enabled"]`` and
     ``data.added=False``.
+
+    Cross-user constraint (Phase 3 gap-fix 2026-05-26): the underlying
+    ``SYNO.Core.Group.Member.add`` call requires admin privileges and
+    on DSM 7.3 has historically been gated to self-targeting only via
+    the AdminCenter UI. For consistency with the file-path SSH writes
+    (which need 0700-home access), this tool refuses when ``user``
+    differs from the calling DSM account with
+    ``category=cross_user_not_supported``. The intended path is then
+    "call this tool with user == the account you're already
+    authenticated as" — which is the idempotent already-admin path
+    99% of the time.
     """
     _validate_username(user, host=host)
+
+    # Cross-user gate (gap 2026-05-26): see _check_calling_user docstring.
+    refusal = await _check_calling_user(host, user, app_context=app_context)
+    if refusal is not None:
+        return refusal
 
     # Step 1: ``admin_check`` for idempotency. DSM's web framework
     # accepts the ``name`` param as a JSON-encoded array on this

@@ -1,0 +1,29 @@
+fix(ssh): refuse cross-user writes (calling-user-only constraint)
+
+Cross-user SSH writes (target_user != session.user) need sudo on
+every host where DSM gives each user's home a 0700 mode owned by
+that user:
+
+  * ssh_add_authorized_key / ssh_remove_authorized_key:
+    `mkdir -p /var/services/homes/<target>/.ssh` fails for the
+    calling account because the parent home dir is 0700 owned by
+    the target user.
+  * ssh_enable_user_ssh: SYNO.Core.Group.Member.add requires admin
+    privileges and historically targets the calling user.
+
+Previously the failure surfaced as a hard `DSMSshError: failed to
+ensure ... authorized_keys exist with correct perms` deep in the
+write path. The new behaviour refuses early with a structured
+envelope:
+
+    {ok: False, data: {category: "cross_user_not_supported",
+                       target_user, calling_user, next_step}}
+
+The same-user path (target == session.user) remains the supported
+flow. Adding a sudo-password mechanism would require persisting
+credentials beyond the DSM session and is out of scope for this
+gap-fix pass (strict-first per feedback_strict_first.md).
+
+The check uses `auth.ensure_session` to pull the calling user from
+the cached DSMSession; on a missing-cred path the check is a no-op
+and lets downstream call_dsm surface the ConfigError.
