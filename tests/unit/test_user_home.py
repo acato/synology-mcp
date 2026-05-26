@@ -543,3 +543,134 @@ async def test_user_home_enable_volume_override_from_config(
     # The step-2 command must reference /volume4/homes, NOT /volume1/homes.
     step2 = [c for c in fake_ssh.commands if "ln -s" in c]
     assert any("ln -s /volume4/homes" in c for c in step2)
+
+
+# ===========================================================================
+# user_home_disable
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_user_home_disable_refuses_when_users_have_keys(
+    app_ctx, fixture_json,
+) -> None:
+    """authorized_keys files present → would_orphan_keys refusal, NO web call."""
+    _seed_session(app_ctx)
+    pre_payload = fixture_json("user_home", "get_enabled.json")
+    find_output = (
+        "/var/services/homes/alice/.ssh/authorized_keys\n"
+        "/var/services/homes/bob/.ssh/authorized_keys\n"
+    )
+
+    routes = {
+        **_enabled_routes_with_volume(),
+        "find /var/services/homes": _ok(find_output),
+    }
+    fake_ssh = _fake_ssh(routes)
+    app_ctx.cache.get("testhost").ssh_client = fake_ssh
+
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        route = mock.get("/webapi/entry.cgi").respond(200, json=pre_payload)
+        result = await user_home.user_home_disable(
+            "testhost", confirm_destroy_keys=False, app_context=app_ctx,
+        )
+
+    assert result["ok"] is False
+    assert result["data"]["category"] == "would_orphan_keys"
+    assert sorted(result["data"]["affected_users"]) == ["alice", "bob"]
+    assert "confirm_destroy_keys" in result["data"]["next_step"]
+    # Web API was called once (pre-check) but NOT a second time (set).
+    assert route.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_user_home_disable_happy_path_with_confirm(
+    app_ctx, fixture_json,
+) -> None:
+    """confirm_destroy_keys=True + users with keys → set succeeds with warning."""
+    _seed_session(app_ctx)
+    pre_payload = fixture_json("user_home", "get_enabled.json")
+    set_ok = {"success": True, "data": {}}
+    find_output = "/var/services/homes/alice/.ssh/authorized_keys\n"
+
+    routes = {
+        **_enabled_routes_with_volume(),
+        "find /var/services/homes": _ok(find_output),
+    }
+    fake_ssh = _fake_ssh(routes)
+    app_ctx.cache.get("testhost").ssh_client = fake_ssh
+
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        mock.get("/webapi/entry.cgi").mock(
+            side_effect=[
+                httpx.Response(200, json=pre_payload),
+                httpx.Response(200, json=set_ok),
+            ]
+        )
+        result = await user_home.user_home_disable(
+            "testhost", confirm_destroy_keys=True, app_context=app_ctx,
+        )
+
+    assert result["ok"] is True
+    assert result["data"]["disabled"] is True
+    assert result["data"]["affected_users"] == ["alice"]
+    assert any("SSH key auth is now broken" in w for w in result["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_user_home_disable_no_keys_no_confirm_required(
+    app_ctx, fixture_json,
+) -> None:
+    """Tri-check enabled, no users have keys → set runs without confirm."""
+    _seed_session(app_ctx)
+    pre_payload = fixture_json("user_home", "get_enabled.json")
+    set_ok = {"success": True, "data": {}}
+
+    routes = {
+        **_enabled_routes_with_volume(),
+        "find /var/services/homes": _ok(""),  # no authorized_keys files
+    }
+    fake_ssh = _fake_ssh(routes)
+    app_ctx.cache.get("testhost").ssh_client = fake_ssh
+
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        mock.get("/webapi/entry.cgi").mock(
+            side_effect=[
+                httpx.Response(200, json=pre_payload),
+                httpx.Response(200, json=set_ok),
+            ]
+        )
+        result = await user_home.user_home_disable(
+            "testhost", confirm_destroy_keys=False, app_context=app_ctx,
+        )
+
+    assert result["ok"] is True
+    assert result["data"]["disabled"] is True
+    assert result["data"]["affected_users"] == []
+    # No "SSH key auth is now broken" warning when no users had keys.
+    assert not any("SSH key auth" in w for w in result["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_user_home_disable_idempotent_when_already_disabled(
+    app_ctx, fixture_json,
+) -> None:
+    """Tri-check already disabled → no web call, no SSH enumeration, 'already disabled'."""
+    _seed_session(app_ctx)
+    pre_payload = fixture_json("user_home", "get_disabled.json")
+    fake_ssh = _fake_ssh(_disabled_routes())
+    app_ctx.cache.get("testhost").ssh_client = fake_ssh
+
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        route = mock.get("/webapi/entry.cgi").respond(200, json=pre_payload)
+        result = await user_home.user_home_disable(
+            "testhost", app_context=app_ctx,
+        )
+
+    assert result["ok"] is True
+    assert result["data"]["disabled"] is False
+    assert "already disabled" in result["warnings"]
+    # Only the pre-check fired, not a second set call.
+    assert route.call_count == 1
+    # No ``find`` command was issued — the short-circuit ran before it.
+    assert not any("find /var/services/homes" in c for c in fake_ssh.commands)

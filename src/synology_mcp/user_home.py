@@ -3,10 +3,13 @@
 """User Home service tools — read (Phase 2) + write (Phase 3b).
 
 Phase 2 shipped ``user_home_is_enabled`` (tri-check). Phase 3b adds the
-write companion :func:`user_home_enable` — applies the DSM 7.3 4-step
-workaround that reconciles synoinfo, the symlink, the web-API flag, and
-the per-user home folder. Idempotent; rollback on partial failure. The
-``user_home_disable`` counterpart lands in a follow-up commit.
+write companions:
+
+  * :func:`user_home_enable`  — applies the DSM 7.3 4-step workaround
+    that reconciles synoinfo, the symlink, the web-API flag, and the
+    per-user home folder. Idempotent; rollback on partial failure.
+  * :func:`user_home_disable` — system-wide off switch with a key-orphan
+    safety rail (refuses unless ``confirm_destroy_keys=True``).
 
 Why the tri-check is non-negotiable
 -----------------------------------
@@ -475,4 +478,127 @@ def _failure_envelope(
     }
 
 
-__all__ = ["user_home_enable", "user_home_is_enabled"]
+# ---------------------------------------------------------------------------
+# user_home_disable (Phase 3b)
+# ---------------------------------------------------------------------------
+
+
+_AUTHKEYS_GLOB = "/var/services/homes/*/.ssh/authorized_keys"
+
+
+async def _list_users_with_authorized_keys(ssh: DSMSshClient) -> list[str]:
+    """Enumerate users with NON-EMPTY ``~/.ssh/authorized_keys`` files.
+
+    Returns the list of user-folder names that have a non-empty
+    ``authorized_keys`` file under ``/var/services/homes/<user>/.ssh/``.
+    An empty file means SSH key auth was already broken for that user,
+    so disabling User Home does not orphan anything new — we don't
+    flag those.
+
+    Uses a single shell pipeline so DSM users with quirky names (dots,
+    underscores, mixed case) survive the round-trip.
+    """
+    # ``find`` instead of ``ls``: DSM ships busybox find that supports
+    # -size +0 reliably. Stderr is shielded so a missing /var/services/homes
+    # (User Home was never enabled) returns an empty list.
+    cmd = (
+        f"sudo -n find {_AUTHKEYS_GLOB} -size +0c -type f 2>/dev/null || true"
+    )
+    res = await ssh.run(cmd, check=False, timeout=15.0)
+    out: list[str] = []
+    for line in res.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # /var/services/homes/<user>/.ssh/authorized_keys -> <user>
+        parts = line.split("/")
+        # Expected length: ['', 'var', 'services', 'homes', '<user>',
+        # '.ssh', 'authorized_keys'] = 7 segments.
+        if len(parts) >= 5 and parts[3] == "homes":
+            out.append(parts[4])
+    # Dedupe while preserving order.
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for name in out:
+        if name not in seen:
+            seen.add(name)
+            deduped.append(name)
+    return deduped
+
+
+async def user_home_disable(
+    host: str, confirm_destroy_keys: bool = False, *, app_context,
+) -> dict:
+    """System-wide ``SYNO.Core.User.Home.set enable=false`` with safety rail.
+
+    Safety rail: by default we SSH-enumerate users that have non-empty
+    ``authorized_keys`` files under ``/var/services/homes/<user>/.ssh/``.
+    If ANY user matches, the call is refused with a
+    ``would_orphan_keys`` envelope and ``next_step="call again with
+    confirm_destroy_keys=True"``. The caller is expected to confirm
+    explicitly because the symlink unhide that follows breaks SSH key
+    auth for every listed user.
+
+    With ``confirm_destroy_keys=True`` we proceed and append a warning
+    naming the affected users so the audit trail makes the destruction
+    visible. DSM preserves the underlying ``/volume*/homes/*`` data —
+    we are NOT deleting anything, just flipping the system-wide flag.
+
+    Idempotency: if the tri-check reports ``enabled=False`` we
+    short-circuit with ``ok=True, data.disabled=False, warnings=["already
+    disabled"]`` — no web call, no SSH key enumeration.
+    """
+    ssh = get_ssh_client(app_context, host)
+
+    pre_envelope = await user_home_is_enabled(host, app_context=app_context)
+    pre_data = pre_envelope.get("data") or {}
+    if not pre_data.get("enabled"):
+        # Tri-check says off. Don't bother with the safety rail; the
+        # tool's contract is "make sure User Home is system-wide off"
+        # and that's already true. We DO surface any disagreement
+        # warnings from the tri-check so the operator knows the state
+        # is partially-on if it is.
+        warnings = list(pre_envelope.get("warnings") or [])
+        warnings.insert(0, "already disabled")
+        return success_envelope(
+            host, {"disabled": False, "user_home": pre_data}, warnings,
+        )
+
+    affected_users = await _list_users_with_authorized_keys(ssh)
+
+    if affected_users and not confirm_destroy_keys:
+        return {
+            "ok": False,
+            "host": host,
+            "data": {
+                "category": "would_orphan_keys",
+                "affected_users": affected_users,
+                "next_step": "call again with confirm_destroy_keys=True",
+            },
+            "warnings": [],
+        }
+
+    body = await call_dsm(
+        app_context, host,
+        api="SYNO.Core.User.Home", method="set", version=1,
+        params={"enable": "false"},
+    )
+    warnings = list(extract_warnings(body))
+    if affected_users:
+        warnings.append(
+            "SSH key auth is now broken for the following users "
+            "(authorized_keys files preserved but unreachable): "
+            + ", ".join(affected_users)
+        )
+
+    return success_envelope(
+        host,
+        {
+            "disabled": True,
+            "affected_users": affected_users,
+        },
+        warnings,
+    )
+
+
+__all__ = ["user_home_disable", "user_home_enable", "user_home_is_enabled"]
