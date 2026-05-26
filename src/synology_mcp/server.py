@@ -63,7 +63,9 @@ def build_app(config: Config | None = None) -> tuple[FastMCP, AppContext]:
             "Phases 1+2 expose read-only auth, raid, network, packages, "
             "user_home, shares, and snapshot_replication tools. Phase 3a "
             "adds three SSH write tools (ssh_add_authorized_key, "
-            "ssh_remove_authorized_key, ssh_enable_user_ssh)."
+            "ssh_remove_authorized_key, ssh_enable_user_ssh). Phase 3b "
+            "adds four filesystem-write tools (user_home_enable, "
+            "user_home_disable, shares_create, shares_delete)."
         ),
     )
 
@@ -156,6 +158,36 @@ def build_app(config: Config | None = None) -> tuple[FastMCP, AppContext]:
     async def user_home_is_enabled(host: str) -> dict:
         return await _safe(user_home.user_home_is_enabled(host, app_context=ctx))
 
+    @mcp.tool(
+        description="Reconcile DSM's User Home machinery in 4 steps: "
+        "synosetkeyvalue userHomeEnable=yes, restore the /var/services/homes "
+        "symlink, SYNO.Core.User.Home.set enable=true, then synouserhome "
+        "--prepare-folder for the given user (if provided). Idempotent: "
+        "tri-check already-enabled short-circuits steps 1-3. Rollback on "
+        "step 2/3 failure restores the previous symlink target."
+    )
+    async def user_home_enable(host: str, user: str | None = None) -> dict:
+        return await _safe(
+            user_home.user_home_enable(host, user=user, app_context=ctx)
+        )
+
+    @mcp.tool(
+        description="Disable User Home system-wide via SYNO.Core.User.Home.set "
+        "enable=false. Safety rail: refuses by default if any user has a "
+        "non-empty ~/.ssh/authorized_keys file (would orphan key auth). "
+        "Pass confirm_destroy_keys=True to proceed; the affected users are "
+        "named in a warning. DSM preserves the /volume*/homes/* data."
+    )
+    async def user_home_disable(
+        host: str, confirm_destroy_keys: bool = False,
+    ) -> dict:
+        return await _safe(
+            user_home.user_home_disable(
+                host, confirm_destroy_keys=confirm_destroy_keys,
+                app_context=ctx,
+            )
+        )
+
     # --- shares -----------------------------------------------------------
 
     @mcp.tool(
@@ -181,6 +213,57 @@ def build_app(config: Config | None = None) -> tuple[FastMCP, AppContext]:
     async def shares_get_snapshot_config(host: str, name: str) -> dict:
         return await _safe(
             shares.shares_get_snapshot_config(host, name, app_context=ctx)
+        )
+
+    @mcp.tool(
+        description="Create a shared folder via SYNO.Core.Share.create. "
+        "Reserved-name pre-flight refuses DSM-reserved names (home/homes/music/"
+        "photo/video/NetBackup/usbshare*/sdshare*/esata*/surveillance/download/"
+        "web*/@*) with category=reserved_share_name. Idempotent: same-name on "
+        "same volume with compatible flags returns data.created=False with "
+        "the 'share already exists' warning; same-name with different config "
+        "refuses with category=share_exists_with_different_config. "
+        "encryption=True requires encryption_passphrase."
+    )
+    async def shares_create(
+        host: str,
+        name: str,
+        volume: str,
+        desc: str = "",
+        hidden: bool = False,
+        enable_recycle_bin: bool = False,
+        encryption: bool = False,
+        encryption_passphrase: str | None = None,
+        enable_share_cow: bool = True,
+    ) -> dict:
+        return await _safe(
+            shares.shares_create(
+                host, name, volume,
+                desc=desc, hidden=hidden,
+                enable_recycle_bin=enable_recycle_bin,
+                encryption=encryption,
+                encryption_passphrase=encryption_passphrase,
+                enable_share_cow=enable_share_cow,
+                app_context=ctx,
+            )
+        )
+
+    @mcp.tool(
+        description="Delete a shared folder via SYNO.Core.Share.delete. "
+        "Safety rail: SSH-probes `du -sb --exclude=@eaDir` on the share path; "
+        "refuses with category=share_not_empty if size > 0 unless force=True. "
+        "Idempotent: a share that's already absent returns ok=True with "
+        "data.deleted=False. DSM does NOT remove the underlying directory "
+        "on delete — when force=True a warning reminds the caller to follow "
+        "up with rm -rf for full cleanup."
+    )
+    async def shares_delete(
+        host: str, name: str, force: bool = False,
+    ) -> dict:
+        return await _safe(
+            shares.shares_delete(
+                host, name, force=force, app_context=ctx,
+            )
         )
 
     # --- snapshot_replication --------------------------------------------
