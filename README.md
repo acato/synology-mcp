@@ -2,7 +2,7 @@
 
 An [MCP](https://modelcontextprotocol.io/) server that wraps the Synology DSM web API so AI agents (Claude Code, Claude Desktop, IDE assistants) can manage Synology NAS appliances without rediscovering DSM's quirks on every task.
 
-**Status:** pre-alpha. Design phase. See [DESIGN.md](DESIGN.md) for the full architecture, tool surface, and DSM API mapping. Implementation is in progress.
+**Status:** beta. Feature-complete MVP — 28 tools across 8 modules (auth, raid, network, packages, user_home, shares, snapshot_replication, ssh) covering read-only inspection and supported write operations. 187 unit tests and 24 live integration tests against DSM 7.3.2 currently pass. API is stable; documented v0 limitations: no cross-user SSH writes (would need a sudo-password mechanism), no offline `.spk` fallback for package install. See [DESIGN.md](DESIGN.md) for the full architecture, tool surface, and DSM API mapping.
 
 ## Why
 

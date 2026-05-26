@@ -1,6 +1,6 @@
 # Contributing to synology-mcp
 
-Thanks for your interest! This project is in early design / pre-alpha — contributions of any size are welcome.
+Thanks for your interest! This project is in beta — feature-complete MVP, stable API, actively maintained — and contributions of any size are welcome.
 
 ## Ground rules
 
