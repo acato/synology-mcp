@@ -43,6 +43,7 @@ class HostConfig:
     ssh_username: str | None = None
     ssh_port: int = 22
     ssh_key_path: str | None = None
+    user_home_volume: str | None = None  # e.g. "/volume1"; overrides auto-detection in user_home_enable
 
     @property
     def base_url(self) -> str:
@@ -106,6 +107,7 @@ class Config:
                 "ssh_username": file_host.ssh_username,
                 "ssh_port": file_host.ssh_port,
                 "ssh_key_path": file_host.ssh_key_path,
+                "user_home_volume": file_host.user_home_volume,
             }
         # Env vars override file values.
         merged.update(env_overlay)
@@ -201,6 +203,7 @@ def _parse_host(name: str, raw: dict[str, Any], defaults: _Defaults) -> HostConf
         ssh_username=raw.get("ssh_username"),
         ssh_port=int(raw.get("ssh_port", defaults.ssh_port)),
         ssh_key_path=raw.get("ssh_key_path"),
+        user_home_volume=raw.get("user_home_volume"),
     )
 
 
@@ -237,6 +240,7 @@ _ENV_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "ssh_username": ("SSH_USERNAME", "SSH_USER"),
     "ssh_port": ("SSH_PORT",),
     "ssh_key_path": ("SSH_KEY_PATH", "SSH_KEY"),
+    "user_home_volume": ("USER_HOME_VOLUME",),
 }
 
 _BOOL_FIELDS = {"use_https", "verify_tls"}
