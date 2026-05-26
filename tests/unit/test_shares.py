@@ -482,3 +482,163 @@ async def test_shares_create_rejects_bad_volume_path(app_ctx) -> None:
             await shares.shares_create(
                 "testhost", "Movies", bad, app_context=app_ctx,
             )
+
+
+# ===========================================================================
+# shares_delete
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_shares_delete_happy_path_on_empty_share(
+    app_ctx, fixture_json,
+) -> None:
+    """Share exists + du reports 0 bytes → delete fires, JSON-array name shape."""
+    _seed_session(app_ctx)
+    list_payload = fixture_json("share", "list_normal.json")
+    delete_ok = {"success": True, "data": {}}
+    fake_ssh = _fake_ssh({"du -sb": _ok("0\n")})
+    app_ctx.cache.get("testhost").ssh_client = fake_ssh
+
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        route = mock.get("/webapi/entry.cgi").mock(
+            side_effect=[
+                httpx.Response(200, json=list_payload),
+                httpx.Response(200, json=delete_ok),
+            ]
+        )
+        result = await shares.shares_delete(
+            "testhost", "Movies", app_context=app_ctx,
+        )
+
+    assert result["ok"] is True
+    assert result["data"]["deleted"] is True
+    assert result["data"]["name"] == "Movies"
+
+    # The second call (delete) carries name as a JSON array.
+    qs = dict(route.calls[1].request.url.params)
+    assert qs["api"] == "SYNO.Core.Share"
+    assert qs["method"] == "delete"
+    assert json.loads(qs["name"]) == ["Movies"]
+
+    # SSH probe used du -sb --exclude=@eaDir on the share path.
+    assert any(
+        "du -sb" in c and "--exclude=@eaDir" in c and "/volume1/Movies" in c
+        for c in fake_ssh.commands
+    )
+
+
+@pytest.mark.asyncio
+async def test_shares_delete_refuses_on_non_empty_without_force(
+    app_ctx, fixture_json,
+) -> None:
+    """du > 0 + force=False → share_not_empty refusal, NO delete call."""
+    _seed_session(app_ctx)
+    list_payload = fixture_json("share", "list_normal.json")
+    fake_ssh = _fake_ssh({"du -sb": _ok("1048576\n")})
+    app_ctx.cache.get("testhost").ssh_client = fake_ssh
+
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        route = mock.get("/webapi/entry.cgi").respond(200, json=list_payload)
+        result = await shares.shares_delete(
+            "testhost", "Movies", force=False, app_context=app_ctx,
+        )
+
+    assert result["ok"] is False
+    assert result["data"]["category"] == "share_not_empty"
+    assert result["data"]["size_bytes"] == 1048576
+    assert result["data"]["volume"] == "/volume1"
+    assert "force=True" in result["data"]["next_step"]
+    # Only the list call fired.
+    assert route.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_shares_delete_force_delete_with_warning(
+    app_ctx, fixture_json,
+) -> None:
+    """force=True bypasses the du probe and adds the rm-rf reminder warning."""
+    _seed_session(app_ctx)
+    list_payload = fixture_json("share", "list_normal.json")
+    delete_ok = {"success": True, "data": {}}
+    # No du route — force=True must skip the probe entirely.
+    fake_ssh = _fake_ssh()
+    app_ctx.cache.get("testhost").ssh_client = fake_ssh
+
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        route = mock.get("/webapi/entry.cgi").mock(
+            side_effect=[
+                httpx.Response(200, json=list_payload),
+                httpx.Response(200, json=delete_ok),
+            ]
+        )
+        result = await shares.shares_delete(
+            "testhost", "Movies", force=True, app_context=app_ctx,
+        )
+
+    assert result["ok"] is True
+    assert result["data"]["deleted"] is True
+    assert any(
+        "DSM does not remove the underlying directory" in w
+        for w in result["warnings"]
+    )
+    assert any("rm -rf /volume1/Movies" in w for w in result["warnings"])
+    # No du command was issued — force skipped the probe.
+    assert not any("du -sb" in c for c in fake_ssh.commands)
+    # Two web calls: list + delete.
+    assert route.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_shares_delete_idempotent_when_share_not_found(app_ctx) -> None:
+    """Share not present in list → ok=True, deleted=False, no delete call."""
+    _seed_session(app_ctx)
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        route = mock.get("/webapi/entry.cgi").respond(
+            200, json=_empty_share_list_body(),
+        )
+        result = await shares.shares_delete(
+            "testhost", "NonExistent", app_context=app_ctx,
+        )
+
+    assert result["ok"] is True
+    assert result["data"]["deleted"] is False
+    assert "share not found" in result["warnings"]
+    assert route.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_shares_delete_treats_missing_dir_as_empty(
+    app_ctx, fixture_json,
+) -> None:
+    """Share definition present but ``du`` returns no output → proceed (already removed on disk)."""
+    _seed_session(app_ctx)
+    list_payload = fixture_json("share", "list_normal.json")
+    delete_ok = {"success": True, "data": {}}
+    # du returns empty stdout → _share_directory_size_bytes returns None.
+    fake_ssh = _fake_ssh({"du -sb": _ok("")})
+    app_ctx.cache.get("testhost").ssh_client = fake_ssh
+
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        mock.get("/webapi/entry.cgi").mock(
+            side_effect=[
+                httpx.Response(200, json=list_payload),
+                httpx.Response(200, json=delete_ok),
+            ]
+        )
+        result = await shares.shares_delete(
+            "testhost", "Movies", app_context=app_ctx,
+        )
+
+    assert result["ok"] is True
+    assert result["data"]["deleted"] is True
+    # No force=True warning because we didn't force — the probe just
+    # found nothing on disk.
+    assert not any("rm -rf" in w for w in result["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_shares_delete_rejects_empty_name(app_ctx) -> None:
+    _seed_session(app_ctx)
+    with pytest.raises(InvalidParam):
+        await shares.shares_delete("testhost", "", app_context=app_ctx)

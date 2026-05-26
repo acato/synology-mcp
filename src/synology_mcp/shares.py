@@ -43,11 +43,13 @@ Key DSM 7.3 quirks handled here:
 from __future__ import annotations
 
 import json
+import shlex
 from typing import Any
 
-from ._helpers import call_dsm, success_envelope
-from .errors import InvalidParam, OtpRequired, PermissionDenied
+from ._helpers import call_dsm, get_ssh_client, success_envelope
+from .errors import DSMSshError, InvalidParam, OtpRequired, PermissionDenied
 from .transport.http import extract_warnings
+from .transport.ssh import DSMSshClient
 
 # ---------------------------------------------------------------------------
 # shares_list
@@ -578,8 +580,133 @@ async def shares_create(
     )
 
 
+# ---------------------------------------------------------------------------
+# shares_delete (Phase 3b)
+# ---------------------------------------------------------------------------
+
+
+async def _share_directory_size_bytes(
+    ssh: DSMSshClient, volume: str, name: str,
+) -> int | None:
+    """Return the on-disk size of ``<volume>/<name>`` in bytes, or None on probe failure.
+
+    Uses ``du -sb`` with ``--exclude=@eaDir`` because DSM creates a
+    sidecar ``@eaDir`` index on every share — non-empty by definition,
+    but not user data. We treat the share as "empty" iff everything
+    OUTSIDE @eaDir is zero bytes.
+
+    Returns None when the path doesn't exist (the share definition is
+    present but the dir was hand-removed earlier) — the caller decides
+    whether that counts as "empty" (it does: ``rm -rf`` already happened).
+    """
+    path = f"{volume}/{name}"
+    cmd = (
+        f"sudo -n du -sb --exclude=@eaDir {shlex.quote(path)} 2>/dev/null "
+        "| awk '{print $1}'"
+    )
+    try:
+        res = await ssh.run(cmd, check=False, timeout=30.0)
+    except DSMSshError:
+        return None
+    out = res.stdout.strip()
+    if not out:
+        return None
+    # ``du`` returns just the numeric byte count when ``-sb`` is used.
+    try:
+        return int(out.splitlines()[0])
+    except (TypeError, ValueError):
+        return None
+
+
+async def shares_delete(
+    host: str, name: str, *, app_context, force: bool = False,
+) -> dict:
+    """Delete a shared folder.
+
+    Safety rail: SSH-probe the share's on-disk size (``du -sb
+    --exclude=@eaDir``). If the result is greater than zero we refuse
+    with ``category="share_not_empty"`` unless ``force=True``. ``@eaDir``
+    is excluded because DSM creates it implicitly on every share — its
+    presence is not real "non-empty".
+
+    With ``force=True`` the delete proceeds and a warning notes that
+    DSM does NOT remove the underlying directory by default; the
+    operator may want to follow up with ``rm -rf`` for full cleanup.
+
+    Idempotency: a share that's already absent from ``shares_list``
+    returns ``ok=True, data.deleted=False, warnings=["share not found"]``.
+
+    DSM 7.3 ``delete`` param shape (verified on CS3 build 86009):
+    ``name`` is a JSON-encoded array of share names. We send a
+    single-element array.
+    """
+    if not name:
+        raise InvalidParam(
+            "share name must be a non-empty string", host=host,
+            details={"param": "name"},
+        )
+
+    # --- idempotency: locate the share -----------------------------------
+    list_envelope = await shares_list(host, app_context=app_context)
+    existing_rows = list_envelope.get("data", {}).get("shares") or []
+    existing = _find_existing_share(existing_rows, name)
+    if existing is None:
+        return success_envelope(
+            host,
+            {"deleted": False, "name": name},
+            warnings=["share not found"],
+        )
+
+    # --- safety rail: empty-share probe ----------------------------------
+    if not force:
+        ssh = get_ssh_client(app_context, host)
+        volume = existing.get("volume") or ""
+        size = await _share_directory_size_bytes(ssh, volume, name)
+        if size is None:
+            # The path doesn't exist — treat as empty and proceed.
+            pass
+        elif size > 0:
+            return {
+                "ok": False,
+                "host": host,
+                "data": {
+                    "category": "share_not_empty",
+                    "name": name,
+                    "size_bytes": size,
+                    "volume": volume,
+                    "next_step": "call again with force=True to delete anyway",
+                },
+                "warnings": [],
+            }
+
+    # --- delete call -----------------------------------------------------
+    body = await call_dsm(
+        app_context, host,
+        api="SYNO.Core.Share", method="delete", version=1,
+        params={"name": json.dumps([name])},
+    )
+    warnings = list(extract_warnings(body))
+    if force:
+        warnings.append(
+            "DSM does not remove the underlying directory on share delete; "
+            f"follow up with `sudo rm -rf {existing.get('volume') or ''}/{name}` "
+            "if you want full cleanup"
+        )
+
+    return success_envelope(
+        host,
+        {
+            "deleted": True,
+            "name": name,
+            "volume": existing.get("volume"),
+        },
+        warnings,
+    )
+
+
 __all__ = [
     "shares_create",
+    "shares_delete",
     "shares_get_acl",
     "shares_get_snapshot_config",
     "shares_list",
