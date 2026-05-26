@@ -1,0 +1,46 @@
+{
+  "success": true,
+  "data": {
+    "shares": [
+      {
+        "desc": "",
+        "enable_share_cow": true,
+        "enable_recycle_bin": false,
+        "enc_auto_mount": false,
+        "encryption": 0,
+        "hidden": false,
+        "is_aclmode": true,
+        "is_support_acl": true,
+        "is_usb_share": false,
+        "name": "Movies",
+        "quota_value": 0,
+        "share_quota_logical_size": 0,
+        "share_quota_status": "v2",
+        "share_quota_used": 1024.5,
+        "unite_permission": false,
+        "uuid": "00000000-0000-0000-0000-000000000001",
+        "vol_path": "/volume1"
+      },
+      {
+        "desc": "Encrypted share",
+        "enable_share_cow": false,
+        "enable_recycle_bin": true,
+        "enc_auto_mount": true,
+        "encryption": 1,
+        "hidden": true,
+        "is_aclmode": false,
+        "is_support_acl": true,
+        "is_usb_share": false,
+        "name": "Vault",
+        "quota_value": 107374182400,
+        "share_quota_logical_size": 0,
+        "share_quota_status": "v2",
+        "share_quota_used": 0,
+        "unite_permission": false,
+        "uuid": "00000000-0000-0000-0000-000000000002",
+        "vol_path": "/volume2"
+      }
+    ],
+    "total": 2
+  }
+}

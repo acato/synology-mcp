@@ -1,0 +1,24 @@
+{
+  "success": true,
+  "data": {
+    "snapshots": [
+      {
+        "name": "GMT+00-2026.05.20-00.00.00",
+        "time": 1747699200,
+        "desc": "",
+        "lock": false,
+        "schedule_snapshot": true,
+        "manual": false
+      },
+      {
+        "name": "GMT+00-2026.05.21-00.00.00",
+        "time": 1747785600,
+        "desc": "before-upgrade",
+        "lock": true,
+        "schedule_snapshot": false,
+        "manual": true
+      }
+    ],
+    "total": 2
+  }
+}

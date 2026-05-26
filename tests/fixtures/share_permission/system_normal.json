@@ -1,0 +1,24 @@
+{
+  "success": true,
+  "data": {
+    "items": [
+      {
+        "is_admin": false,
+        "is_custom": false,
+        "is_deny": false,
+        "is_readonly": false,
+        "is_writable": false,
+        "name": "ftp"
+      },
+      {
+        "is_admin": true,
+        "is_custom": false,
+        "is_deny": false,
+        "is_readonly": false,
+        "is_writable": false,
+        "name": "MediaServer"
+      }
+    ],
+    "total": 2
+  }
+}
