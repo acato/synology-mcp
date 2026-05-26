@@ -212,15 +212,21 @@ Detail on one package: same fields as `list` plus `install_path`, `last_started_
 
 #### `packages_install(host, package_id, version=None, accept_eula=False)`
 
-Install a package. Implementation:
+Install a package. **DSM 7.3 verb chain** (Phase 3 gap-fix 2026-05-26 — the legacy `install_from_server` method does NOT exist on DSM 7.3.2 build 86009 and returns code 103 method-not-supported):
 
-1. Try `SYNO.Core.Package.Installation` `install_from_server`.
-2. If that returns DSM error 1000-series (install_from_server failures), fall back to:
-   - `SYNO.Core.Package.Installation` `download` (writes the .spk to `/tmp` on the NAS),
-   - `SYNO.Core.Package.Installation` `install` against the downloaded file.
-3. If `accept_eula=False` and the package has an EULA, surface as `EulaRequired` with the EULA text and abort.
+1. `SYNO.Core.Package.get` v1 — idempotency / upgrade gate. Same-version already installed → `installed=False, method="noop"`. Different-version installed → refuse with `category="upgrade_required"`.
+2. `SYNO.Core.Package.Server.list` v2 — fetch the catalog row for `package_id`. Each row carries `{package, version, link, md5, size, type, source, beta, qinst}` — those become the install request payload. Missing row → refuse with `category="not_in_catalog"`. Caller-pinned version vs. catalog's only-version → refuse with `category="version_mismatch"`.
+3. `SYNO.Core.Package.Installation` `install` v1 with `{name, is_syno, beta, url, checksum, filesize, type, blqinst, operation="install"}` — the canonical DSM 7.3 install payload (verified by reading `/usr/syno/synoman/webman/modules/PkgManApp/PkgManApp.js`). The DSM-internal flow downloads the .spk from the Synology repo + installs in one async task whose id is `@SYNOPKG_DOWNLOAD_<package_id>`.
+4. `SYNO.Core.Package.Installation.status` v1 polling until `finished=True` (best-effort, 300s timeout).
+5. `SYNO.Core.Package.get` v1 again — verify the installed version.
 
-Returns the installed version + `method` (`server` or `spk_fallback`).
+EULA gate: if step 3's response carries `data.eula`/`data.license`/`data.eula_text` and `accept_eula=False`, surface `category="eula_required"` with the text and abort. `accept_eula=True` re-runs step 3 with `accept_eula=true` in the params.
+
+Returns `{installed, version, method, package_id}`. `method` values:
+* `"online"` — full install via the catalog-row payload (canonical path).
+* `"noop"` — idempotency short-circuit (already installed at requested or unspecified version).
+
+DSM 1000-series errors during the install call surface as `category="online_install_failed"` with the raw DSM code. The legacy `"spk_fallback"` path (manual `.spk` upload via `SYNO.Core.Package.Installation.upload` + simpler install payload) is documented in `src/synology_mcp/packages.py` but not implemented in this MVP — operators hitting `online_install_failed` should install manually via the DSM UI.
 
 #### `packages_uninstall(host, package_id)`
 
@@ -249,9 +255,17 @@ Apply the DSM 7.3 workaround atomically:
 
 On step failure, rolls back: re-restores the old `/var/services/homes` symlink target, leaves synoinfo as-is (writes to it are reversible by re-calling with `enable=false`). Returns per-step status.
 
-#### `user_home_disable(host)`
+#### `user_home_disable(host, confirm_destroy_keys=False)`
 
-Web API call only; does NOT delete `/volume*/homes/*` data.
+Web API call to `SYNO.Core.User.Home.set enable=false`. Does NOT delete `/volume*/homes/*` data.
+
+Safety rails (two layers — Phase 3 gap-fix 2026-05-26):
+
+1. **sudo gate**: the would-orphan-keys enumeration needs `sudo -n find /var/services/homes/*/.ssh/authorized_keys -size +0c -type f` to read every user's authorized_keys (those files live in 0700-mode home dirs owned by the target user). If the calling account does NOT have NOPASSWD sudo configured, the probe fails with `sudo: a password is required` / `sudo: a terminal is required` on stderr + non-zero exit. We treat that exact failure mode as a hard refusal — `category="sudo_required"` — UNLESS `confirm_destroy_keys=True` is passed to explicitly bypass the rail. The bug-fix for the pre-gap-fix behaviour was treating sudo failure as "no users have keys" and proceeding with the destructive disable.
+
+2. **would-orphan-keys gate**: when the enumeration succeeds and returns a non-empty user list, the call is refused with `category="would_orphan_keys"` and the affected_users list. `confirm_destroy_keys=True` overrides.
+
+When `confirm_destroy_keys=True` and the sudo probe still fails, we proceed (caller-explicit override) but record a warning `"sudo -n unavailable: would_orphan_keys check skipped; every user's SSH keys are at risk of being orphaned"` so the audit trail makes the bypass visible.
 
 ### 5.4 snapshot_replication_*
 
@@ -336,15 +350,25 @@ SSH service enabled? Current port. List of users with SSH app-permission.
 
 Change DSM SSH port via `SYNO.Core.Terminal.set`. Warns about firewall rules and confirms reachability post-change.
 
+#### Calling-user constraint (Phase 3 gap-fix 2026-05-26)
+
+`ssh_add_authorized_key`, `ssh_remove_authorized_key`, and `ssh_enable_user_ssh` refuse when `user` differs from the DSM account this MCP is authenticated as (`session.user`). Refusal envelope: `{ok: False, data: {category: "cross_user_not_supported", target_user, calling_user, next_step}}`.
+
+Rationale: DSM gives each user's home a 0700 mode owned by that user. Writing to a different user's `~/.ssh/` from the calling account needs sudo, which would require a password-on-stdin mechanism that the MCP does not (yet) ship. Refusing early surfaces a structured error instead of a deep `DSMSshError` from a failing `mkdir -p`. The same-user path remains fully supported and is the only path with live-integration coverage.
+
 #### `ssh_enable_user_ssh(host, user)`
 
-Grant SSH app-permission to a user.
+Grant SSH access to `user` by adding them to the `administrators` group via `SYNO.Core.Group.Member` `admin_check` + `add` (DSM 7.3 has no per-user `SYNO.SSH` AppPriv row). Idempotent — if `admin_check` says the user is already an admin, returns `data.added=False` with `warnings=["already enabled"]`.
+
+Subject to the calling-user constraint above.
 
 #### `ssh_add_authorized_key(host, user, pubkey, comment="")`
 
-Append the pubkey to `/volume*/homes/<user>/.ssh/authorized_keys`. Idempotent — if the pubkey bytes are already present, returns `ok` with `warnings=["key already present"]`. Implementation uses base64-over-`exec_command` (not SFTP — see DSM SFTP quirk).
+Append the pubkey to `/var/services/homes/<user>/.ssh/authorized_keys`. Idempotent — if the pubkey bytes are already present, returns `data.added=False` with `warnings=["key already present"]`. Implementation uses base64-over-`exec_command` (not SFTP — see DSM SFTP quirk in §10).
 
-Pre-flight: verifies User Home is enabled for that user; if not, refers to `user_home_enable` and refuses.
+Pre-flight: verifies User Home is enabled (`user_home_is_enabled` tri-check). If not, refers to `user_home_enable` and refuses with `category="precondition"`.
+
+Subject to the calling-user constraint above.
 
 #### `ssh_list_authorized_keys(host, user)`
 
@@ -352,7 +376,9 @@ Returns each key with `type` (ed25519/rsa/...), `fingerprint` (SHA256), `comment
 
 #### `ssh_remove_authorized_key(host, user, fingerprint)`
 
-Remove by fingerprint. Returns `removed_count`.
+Remove by fingerprint. Returns `removed_count`. Idempotent — `removed_count=0` is `ok=True` with no warnings. Unparseable lines in the file are preserved untouched.
+
+Subject to the calling-user constraint above.
 
 ### 5.8 network_*
 
@@ -444,11 +470,11 @@ A host with `ip` but no `password` (and no `ssh_key_path` for SSH-only tools) wi
 | `auth_whoami` | session cache (no DSM call unless cache miss) |
 | `packages_list` | `SYNO.Core.Package` v2 `list` + per-pkg `get` |
 | `packages_status` | `SYNO.Core.Package` v2 `get` + (ContainerManager only) `docker info` over SSH |
-| `packages_install` | primary: `SYNO.Core.Package.Installation` `install_from_server`; fallback: `download` then `install` |
-| `packages_uninstall` | `SYNO.Core.Package.Uninstallation` `uninstall` |
+| `packages_install` | `SYNO.Core.Package.get` v1 (idempotency) + `SYNO.Core.Package.Server` `list` v2 (fetch catalog row → `link`/`md5`/`size`/`type`/`source`/`beta`/`qinst`) + `SYNO.Core.Package.Installation` `install` v1 with `{name, is_syno, beta, url, checksum, filesize, type, blqinst, operation}` + `SYNO.Core.Package.Installation` `status` v1 polling. DSM 7.3 does NOT support the legacy `install_from_server` verb (returns 103). |
+| `packages_uninstall` | `SYNO.Core.Package.Uninstallation` `uninstall` v1 + `SYNO.Core.Package.Installation` `status` v1 polling |
 | `user_home_is_enabled` | `SYNO.Core.User.Home` `get` + SSH `synogetkeyvalue /etc/synoinfo.conf userHomeEnable` + `readlink /var/services/homes` |
 | `user_home_enable` | SSH `synosetkeyvalue` + SSH `ln -s` + `SYNO.Core.User.Home` `set` + SSH `synouserhome --prepare-folder` |
-| `user_home_disable` | `SYNO.Core.User.Home` `set enable_user_home=false` |
+| `user_home_disable` | SSH `sudo -n find /var/services/homes/*/.ssh/authorized_keys -size +0c -type f` (would-orphan-keys + sudo-required safety rails) + `SYNO.Core.User.Home` `set enable=false` |
 | `snapshot_replication_list_plans` | `SYNO.DR.Plan` `list` + `SYNO.Replica.Share` `list` |
 | `snapshot_replication_plan_status` | `SYNO.DR.Plan` `get` |
 | `snapshot_replication_recent_activity` | `SYNO.DR.Plan` `list_activity` (read-only) |
@@ -462,10 +488,10 @@ A host with `ip` but no `password` (and no `ssh_key_path` for SSH-only tools) wi
 | `raid_hardware_info` | `SYNO.Core.System` `info` (model/serial/cpu/ram_size in MB) + `SYNO.Core.Network.Interface` `list` for the NIC table |
 | `ssh_get_state` | `SYNO.Core.Terminal` `get` + `SYNO.Core.Group.Member` for SSH group |
 | `ssh_set_port` | `SYNO.Core.Terminal` `set` |
-| `ssh_enable_user_ssh` | `SYNO.Core.Group.Member` add to `administrators`-equivalent or per-app permission |
-| `ssh_add_authorized_key` | SSH `printf %s '<b64>' | base64 -d >> ~/.ssh/authorized_keys` (NO SFTP — see §10) |
+| `ssh_enable_user_ssh` | `SYNO.Core.Group.Member` `admin_check` v1 + `add` v1 (target group: `administrators`). Refuses cross-user requests with `category=cross_user_not_supported`. |
+| `ssh_add_authorized_key` | SSH `printf %s '<b64>' | base64 -d >> ~/.ssh/authorized_keys` (NO SFTP — see §10). Refuses cross-user requests with `category=cross_user_not_supported`. |
 | `ssh_list_authorized_keys` | SSH `cat ~/.ssh/authorized_keys` + parsing |
-| `ssh_remove_authorized_key` | SSH read + filter + write (atomic via `mv tmp final`) |
+| `ssh_remove_authorized_key` | SSH read + filter + write (atomic via `mv tmp final`). Refuses cross-user requests with `category=cross_user_not_supported`. |
 | `network_list_interfaces` | `SYNO.Core.Network.Interface` `list` (returns `data` as a top-level list with `ifname`/`ip`/`mask`/`speed`/`status`) + SSH `cat /sys/class/net/<if>/{address,speed,operstate,mtu,duplex,carrier}` |
 | `network_get_interface` | same plus `ethtool` over SSH |
 
