@@ -498,16 +498,24 @@ _UNINSTALL_DENYLIST: dict[str, str] = {
 def _is_not_installed_error(exc: Exception) -> bool:
     """Return True if `exc` looks like 'package not installed'.
 
-    DSM 7.3 returns code 102/103 for ``SYNO.Core.Package.get`` on a
-    package_id it doesn't know — but 102/103 also mean
-    "API/method/version not supported on this build". We rely on the
-    caller having already validated the API is registered (e.g. via
-    a prior ``packages_list`` call) and treat any UnsupportedDSMVersion
-    raised by ``get`` as 'not installed' since ``get`` itself is
-    confirmed-present on 7.3.
+    DSM 7.3 returns two different code families for
+    ``SYNO.Core.Package.get`` against a package_id it doesn't know:
+
+      * 102/103/104 — "API/method/version not supported on this build".
+        ``Package.get`` itself is confirmed-present on 7.3 so we treat
+        a 10x raised by ``get`` as "not installed" rather than a
+        version mismatch.
+      * 4545 — DSM 7.3 Package Center error: ``package is not
+        installed`` (verified live on CS4 / build 86009). The 4500-
+        family of error codes is DSM Package Center's private range.
+
+    Any other DSMError bubbles to the caller.
     """
     from .errors import UnsupportedDSMVersion
-    return isinstance(exc, UnsupportedDSMVersion)
+    if isinstance(exc, UnsupportedDSMVersion):
+        return True
+    code = getattr(exc, "dsm_error_code", None)
+    return code == 4545
 
 
 async def _get_installed_package(

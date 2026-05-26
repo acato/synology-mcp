@@ -248,6 +248,19 @@ def _get_not_installed_body() -> dict:
     return {"success": False, "error": {"code": 102}}
 
 
+def _get_not_installed_4545_body() -> dict:
+    """DSM 7.3 Package Center variant: code 4545 = ``package is not installed``.
+
+    Observed live on CS4 / DSM 7.3 build 86009 when calling Package.get
+    against ``LogCenter`` while it was uninstalled. The 4500-family is
+    Package Center's private error range and is NOT mapped to a
+    specific exception class — it surfaces as generic DSMError, so
+    ``_is_not_installed_error`` must treat it as "not installed" by
+    code, not by isinstance check.
+    """
+    return {"success": False, "error": {"code": 4545}}
+
+
 def _get_installed_body(package_id: str, version: str) -> dict:
     return {
         "success": True,
@@ -297,6 +310,53 @@ async def test_install_happy_path_install_from_server(app_ctx) -> None:
     assert result["data"]["method"] == "server"
     assert result["data"]["version"] == "1.2.3"
     assert result["data"]["package_id"] == "Test"
+
+
+@pytest.mark.asyncio
+async def test_install_treats_dsm_4545_as_not_installed(app_ctx) -> None:
+    """Live regression: DSM 7.3 returns 4545 from Package.get for an uninstalled
+    package_id (observed on CS4 against LogCenter). The 4500-family is Package
+    Center's private range and isn't mapped to a specific exception class —
+    ``_is_not_installed_error`` must treat it as "not installed" via the
+    raw code, otherwise the generic DSMError bubbles and the install path
+    never starts.
+    """
+    _seed_session(app_ctx)
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        mock.get("/webapi/entry.cgi").mock(
+            side_effect=[
+                # 1. Package.get -> 4545 (DSM Package Center "not installed").
+                httpx.Response(200, json=_get_not_installed_4545_body()),
+                # 2. install_from_server -> task_id.
+                httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": {"task_id": "task_4545"},
+                    },
+                ),
+                # 3. status -> finished.
+                httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": {"finished": True, "status": "done"},
+                    },
+                ),
+                # 4. Package.get -> installed at v9.9.9.
+                httpx.Response(
+                    200, json=_get_installed_body("LogCenter", "9.9.9"),
+                ),
+            ],
+        )
+        result = await packages.packages_install(
+            "testhost", "LogCenter", app_context=app_ctx,
+        )
+
+    assert result["ok"] is True
+    assert result["data"]["installed"] is True
+    assert result["data"]["method"] == "server"
+    assert result["data"]["version"] == "9.9.9"
 
 
 @pytest.mark.asyncio
