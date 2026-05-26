@@ -442,6 +442,59 @@ _INSTALL_POLL_TIMEOUT_SECONDS = 300.0
 _INSTALL_POLL_INTERVAL_SECONDS = 2.0
 
 
+# Denylist for packages_uninstall. Removing any of these without
+# ``force=True`` breaks other systems we run on the same NAS — the
+# whole point of the safety rail is to make a misclick on a CM
+# uninstall require a deliberate second action.
+#
+# Justification per entry:
+#   * ContainerManager / Docker  -> Plex, Immich, Calibre-Web depend on it.
+#   * SnapshotReplication / ReplicationService -> sysop SR backups.
+#   * StorageManager             -> Storage administration UI; uninstall
+#                                   leaves the volume-management UI in a
+#                                   degraded state that the user has to
+#                                   recover via a DSM reinstall.
+#   * WebStation / Apache* / MariaDB* / PHP* -> hosts Caddy/HA fronted
+#                                   admin UIs on some boxes; collateral
+#                                   risk is too high.
+#   * SecureSignIn / LDAPServer / DirectoryServer -> the auth stack
+#                                   itself; removing it can lock the
+#                                   account out of the box.
+#   * HyperBackup / HyperBackupVault -> off-box backup target dependencies
+#                                   (added beyond the proposed list
+#                                   because the user's roadmap calls
+#                                   out cross-continent Hyper Backup;
+#                                   removing the package would break
+#                                   the entire DR chain).
+_UNINSTALL_DENYLIST: dict[str, str] = {
+    # Container / Docker
+    "ContainerManager": "Plex, Immich, Calibre-Web depend on the docker daemon",
+    "Docker": "Plex, Immich, Calibre-Web depend on the docker daemon",
+    # Snapshot Replication backbone
+    "SnapshotReplication": "sysop SR backups depend on this package",
+    "ReplicationService": "sysop SR backups depend on this package",
+    # Hyper Backup chain (cross-continent backup roadmap)
+    "HyperBackup": "off-box backup chain depends on this package",
+    "HyperBackupVault": "off-box backup chain depends on this package",
+    # Storage admin UI
+    "StorageManager": "removing StorageManager leaves the Storage UI broken",
+    # Web stack collateral risk
+    "WebStation": "hosts Caddy/HA admin UIs on some boxes",
+    "Apache22": "WebStation backend",
+    "Apache24": "WebStation backend",
+    "MariaDB10": "WebStation database backend",
+    "MariaDB11": "WebStation database backend",
+    "PHP7.4": "WebStation runtime",
+    "PHP8.0": "WebStation runtime",
+    "PHP8.1": "WebStation runtime",
+    "PHP8.2": "WebStation runtime",
+    # Auth stack — removing locks accounts out
+    "SecureSignIn": "auth dependency; uninstalling can lock accounts out",
+    "LDAPServer": "auth dependency; uninstalling can lock accounts out",
+    "DirectoryServer": "auth dependency; uninstalling can lock accounts out",
+}
+
+
 def _is_not_installed_error(exc: Exception) -> bool:
     """Return True if `exc` looks like 'package not installed'.
 
@@ -760,8 +813,95 @@ async def packages_install(
     )
 
 
+async def packages_uninstall(
+    host: str, package_id: str, force: bool = False, *, app_context,
+) -> dict:
+    """Uninstall a package from `host`.
+
+    Safety rail: ``package_id`` is checked against an in-process
+    denylist of packages that other agents and the sysop's
+    infrastructure depend on (ContainerManager, SnapshotReplication,
+    HyperBackup, etc.). Matches are refused with
+    ``category="denylist"`` unless ``force=True`` is passed.
+
+    Idempotency: if the package is not installed, returns
+    ``ok=True, data.uninstalled=False,
+    warnings=["package not installed"]`` — no API call fires.
+
+    DSM 7.3 uses ``SYNO.Core.Package.Uninstallation`` v1 with method
+    ``uninstall`` and a ``package`` param. The async completion shape
+    mirrors ``Installation`` so we use the same poll loop.
+    """
+    if not package_id:
+        raise InvalidParam(
+            "package_id must be a non-empty string", host=host,
+            details={"param": "package_id"},
+        )
+
+    # --- denylist pre-flight -------------------------------------------------
+    denylist_reason = _UNINSTALL_DENYLIST.get(package_id)
+    if denylist_reason and not force:
+        return {
+            "ok": False,
+            "host": host,
+            "data": {
+                "category": "denylist",
+                "package_id": package_id,
+                "denylist_reason": denylist_reason,
+                "next_step": "pass force=True to override",
+            },
+            "warnings": [],
+        }
+
+    # --- idempotency: is the package installed? ------------------------------
+    existing = await _get_installed_package(app_context, host, package_id)
+    if existing is None:
+        return success_envelope(
+            host,
+            {
+                "uninstalled": False,
+                "package_id": package_id,
+            },
+            warnings=["package not installed"],
+        )
+
+    warnings: list[str] = []
+    if denylist_reason and force:
+        warnings.append(
+            f"force=True override: removing {package_id} despite denylist "
+            f"({denylist_reason})"
+        )
+
+    # --- uninstall call ------------------------------------------------------
+    body = await call_dsm(
+        app_context, host,
+        api="SYNO.Core.Package.Uninstallation",
+        method="uninstall", version=1,
+        params={"package": package_id},
+    )
+    warnings.extend(extract_warnings(body))
+    data = body.get("data") or {}
+    task_id = data.get("task_id") or data.get("taskid")
+    if task_id:
+        final_body = await _poll_install_task(
+            app_context, host, str(task_id),
+        )
+        warnings.extend(extract_warnings(final_body))
+
+    return success_envelope(
+        host,
+        {
+            "uninstalled": True,
+            "package_id": package_id,
+            "previous_version": str(existing.get("version") or ""),
+        },
+        warnings,
+    )
+
+
 __all__ = [
     "packages_install",
     "packages_list",
     "packages_status",
+    "packages_uninstall",
 ]
