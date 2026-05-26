@@ -1,0 +1,11 @@
+{
+  "success": true,
+  "data": {
+    "users": [
+      {
+        "name": "alice",
+        "is_admin": true
+      }
+    ]
+  }
+}
