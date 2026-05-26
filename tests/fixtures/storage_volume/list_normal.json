@@ -1,0 +1,27 @@
+{
+  "success": true,
+  "data": {
+    "volumes": [
+      {
+        "display_name": "Volume 1",
+        "volume_path": "/volume1",
+        "fs_type": "btrfs",
+        "size_total": 23456789012345,
+        "size_used": 12345678901234,
+        "raid_type": "raid6",
+        "encrypted": false,
+        "status": "normal"
+      },
+      {
+        "display_name": "Volume 2",
+        "volume_path": "/volume2",
+        "fs_type": "ext4",
+        "size_total": 1000000000000,
+        "size_used": 250000000000,
+        "raid_type": "raid1",
+        "encrypted": true,
+        "status": "normal"
+      }
+    ]
+  }
+}

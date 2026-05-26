@@ -1,0 +1,25 @@
+{
+  "success": true,
+  "data": {
+    "disks": [
+      {
+        "disk_id": "sda",
+        "model": "WD80EFAX-00",
+        "serial": "REDACTED_SERIAL_1",
+        "capacity": 8001563222016,
+        "smart_status": "normal",
+        "temp": 38,
+        "container_type": "internal"
+      },
+      {
+        "disk_id": "sdb",
+        "model": "WD80EFAX-00",
+        "serial": "REDACTED_SERIAL_2",
+        "capacity": 8001563222016,
+        "smart_status": "warning",
+        "temp": 42,
+        "container_type": "internal"
+      }
+    ]
+  }
+}

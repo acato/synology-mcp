@@ -1,0 +1,37 @@
+{
+  "success": true,
+  "data": {
+    "interfaces": [
+      {
+        "id": "eth0",
+        "mac": "00:00:5E:00:53:01",
+        "mtu": 1500,
+        "ip": "192.0.2.10",
+        "ipv6": [
+          { "address": "2001:db8::10", "prefix": 64 }
+        ],
+        "speed": 1000,
+        "status": "up",
+        "type": "ethernet"
+      },
+      {
+        "id": "eth1",
+        "mac": "00:00:5E:00:53:02",
+        "mtu": 1500,
+        "ip": "",
+        "speed": 0,
+        "status": "down",
+        "type": "ethernet"
+      },
+      {
+        "id": "eth2",
+        "mac": "00:00:5E:00:53:03",
+        "mtu": 9000,
+        "ip": "192.0.2.20",
+        "speed": 10000,
+        "status": "up",
+        "type": "ethernet"
+      }
+    ]
+  }
+}

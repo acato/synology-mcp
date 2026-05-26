@@ -1,0 +1,11 @@
+{
+  "success": false,
+  "error": {
+    "code": 403,
+    "errors": {
+      "types": [
+        { "type": "otp" }
+      ]
+    }
+  }
+}

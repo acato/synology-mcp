@@ -1,0 +1,11 @@
+{
+  "success": true,
+  "data": {
+    "sid": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+    "synotoken": "TOKEN_PLACEHOLDER_AAAAAAAAAA",
+    "did": "did_placeholder_value",
+    "device_id": "device_placeholder",
+    "is_portal_port": false,
+    "account": "Aless"
+  }
+}
