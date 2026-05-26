@@ -1,7 +1,15 @@
 # Copyright 2026 synology-mcp contributors
 # Licensed under the Apache License, Version 2.0 (see LICENSE)
-"""Unit tests for shares.py — respx-only (no SSH involved)."""
+"""Unit tests for shares.py — respx-only (no SSH for read paths).
+
+Phase 3b write tools (``shares_create``, ``shares_delete``) also live
+in this file. ``shares_create`` is pure-respx; ``shares_delete`` is the
+only share tool that touches SSH (for the empty-share size probe).
+"""
 from __future__ import annotations
+
+import json
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -10,6 +18,7 @@ import respx
 from synology_mcp import shares
 from synology_mcp.errors import InvalidParam, PermissionDenied
 from synology_mcp.session import DSMSession
+from synology_mcp.transport.ssh import DSMSshClient, SshResult
 
 
 def _seed_session(app_ctx) -> None:
@@ -199,3 +208,277 @@ async def test_shares_get_snapshot_config_rejects_empty_name(app_ctx) -> None:
         await shares.shares_get_snapshot_config(
             "testhost", "", app_context=app_ctx,
         )
+
+
+# ===========================================================================
+# Phase 3b helpers
+# ===========================================================================
+
+
+def _ok(stdout: str = "", exit_status: int = 0, stderr: str = "") -> SshResult:
+    return SshResult(
+        command="x", stdout=stdout, stderr=stderr, exit_status=exit_status,
+    )
+
+
+def _fake_ssh(routes=None) -> DSMSshClient:
+    """Substring-routed fake DSMSshClient. Records every command on .commands."""
+    fake = MagicMock(spec=DSMSshClient)
+    fake.commands = []
+
+    async def _run(command, *_, **__):
+        fake.commands.append(command)
+        for needle, result in (routes or {}).items():
+            if needle in command:
+                if callable(result):
+                    return result(command)
+                return SshResult(
+                    command=command,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                    exit_status=result.exit_status,
+                )
+        return SshResult(
+            command=command, stdout="", stderr="", exit_status=0,
+        )
+
+    fake.run = AsyncMock(side_effect=_run)
+    return fake
+
+
+def _empty_share_list_body() -> dict:
+    """List body with no shares — for idempotency-miss path."""
+    return {"success": True, "data": {"shares": [], "total": 0}}
+
+
+def _share_list_body_with(rows: list[dict]) -> dict:
+    return {"success": True, "data": {"shares": rows, "total": len(rows)}}
+
+
+# ===========================================================================
+# shares_create
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_shares_create_happy_path_plain(app_ctx) -> None:
+    """Non-encrypted, non-hidden, recycle-bin-off create against an empty fleet."""
+    _seed_session(app_ctx)
+    create_ok = {"success": True, "data": {"name": "Movies"}}
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        route = mock.get("/webapi/entry.cgi").mock(
+            side_effect=[
+                httpx.Response(200, json=_empty_share_list_body()),
+                httpx.Response(200, json=create_ok),
+            ]
+        )
+        result = await shares.shares_create(
+            "testhost", "Movies", "/volume1", app_context=app_ctx,
+        )
+
+    assert result["ok"] is True
+    assert result["data"]["created"] is True
+    assert result["data"]["share"]["name"] == "Movies"
+    assert result["data"]["share"]["volume"] == "/volume1"
+    assert result["data"]["share"]["encrypted"] is False
+    assert result["data"]["share"]["hidden"] is False
+    assert route.call_count == 2
+
+    # The second call (create) carries the shareinfo JSON blob.
+    create_url = route.calls[1].request.url
+    qs = dict(create_url.params)
+    assert qs["api"] == "SYNO.Core.Share"
+    assert qs["method"] == "create"
+    assert qs["name"] == "Movies"
+    shareinfo = json.loads(qs["shareinfo"])
+    assert shareinfo["name"] == "Movies"
+    assert shareinfo["vol_path"] == "/volume1"
+    assert shareinfo["encryption"] == 0
+    assert shareinfo["hidden"] is False
+    assert shareinfo["enable_recycle_bin"] is False
+    assert "enc_passwd" not in shareinfo
+
+
+@pytest.mark.asyncio
+async def test_shares_create_happy_path_hidden_with_recycle_bin(app_ctx) -> None:
+    """Hidden + recycle-bin enabled goes through to shareinfo verbatim."""
+    _seed_session(app_ctx)
+    create_ok = {"success": True, "data": {}}
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        route = mock.get("/webapi/entry.cgi").mock(
+            side_effect=[
+                httpx.Response(200, json=_empty_share_list_body()),
+                httpx.Response(200, json=create_ok),
+            ]
+        )
+        result = await shares.shares_create(
+            "testhost", "Vault", "/volume2",
+            hidden=True, enable_recycle_bin=True, desc="audit",
+            app_context=app_ctx,
+        )
+
+    assert result["ok"] is True
+    assert result["data"]["created"] is True
+    assert result["data"]["share"]["hidden"] is True
+    assert result["data"]["share"]["recycle_bin_enabled"] is True
+
+    qs = dict(route.calls[1].request.url.params)
+    shareinfo = json.loads(qs["shareinfo"])
+    assert shareinfo["hidden"] is True
+    assert shareinfo["enable_recycle_bin"] is True
+    assert shareinfo["desc"] == "audit"
+
+
+@pytest.mark.asyncio
+async def test_shares_create_happy_path_encrypted(app_ctx) -> None:
+    """Encrypted share: encryption=1 and enc_passwd present in shareinfo."""
+    _seed_session(app_ctx)
+    create_ok = {"success": True, "data": {}}
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        route = mock.get("/webapi/entry.cgi").mock(
+            side_effect=[
+                httpx.Response(200, json=_empty_share_list_body()),
+                httpx.Response(200, json=create_ok),
+            ]
+        )
+        result = await shares.shares_create(
+            "testhost", "Secrets", "/volume1",
+            encryption=True, encryption_passphrase="hunter2hunter2",
+            app_context=app_ctx,
+        )
+
+    assert result["data"]["created"] is True
+    assert result["data"]["share"]["encrypted"] is True
+    qs = dict(route.calls[1].request.url.params)
+    shareinfo = json.loads(qs["shareinfo"])
+    assert shareinfo["encryption"] == 1
+    assert shareinfo["enc_passwd"] == "hunter2hunter2"
+
+
+@pytest.mark.asyncio
+async def test_shares_create_encryption_without_passphrase_invalid(app_ctx) -> None:
+    """encryption=True + no passphrase → InvalidParam BEFORE any DSM call."""
+    _seed_session(app_ctx)
+    with respx.mock(
+        base_url="https://192.0.2.10:5001", assert_all_called=False,
+    ) as mock:
+        route = mock.get("/webapi/entry.cgi").respond(200, json={"success": True})
+        with pytest.raises(InvalidParam):
+            await shares.shares_create(
+                "testhost", "Secrets", "/volume1",
+                encryption=True, app_context=app_ctx,
+            )
+        assert route.called is False
+
+
+@pytest.mark.parametrize("reserved_name", [
+    "music", "photo", "video", "home", "homes", "NetBackup",
+    "surveillance", "download",
+    # Prefix matches (any suffix counts).
+    "usbshare1", "usbshare2-1", "sdshare", "esata-1", "web", "webdefault",
+    # Case-insensitive: Music should be denied too.
+    "Music", "PHOTO",
+    # System aliases.
+    "@appstore", "@home",
+])
+@pytest.mark.asyncio
+async def test_shares_create_refuses_reserved_name(app_ctx, reserved_name) -> None:
+    """Reserved names refuse with category=reserved_share_name, no DSM calls."""
+    _seed_session(app_ctx)
+    with respx.mock(
+        base_url="https://192.0.2.10:5001", assert_all_called=False,
+    ) as mock:
+        route = mock.get("/webapi/entry.cgi").respond(
+            200, json={"success": True, "data": {}},
+        )
+        result = await shares.shares_create(
+            "testhost", reserved_name, "/volume1", app_context=app_ctx,
+        )
+    assert result["ok"] is False
+    assert result["data"]["category"] == "reserved_share_name"
+    assert result["data"]["name"] == reserved_name
+    assert "next_step" in result["data"]
+    # No DSM call fired — pre-flight rejected before the list call.
+    assert route.called is False
+
+
+@pytest.mark.asyncio
+async def test_shares_create_idempotent_when_same_config(
+    app_ctx, fixture_json,
+) -> None:
+    """Same name + same volume + same flags → created=False, no create call."""
+    _seed_session(app_ctx)
+    list_payload = fixture_json("share", "list_normal.json")
+    # Movies in the fixture: /volume1, encryption=0, recycle_bin=False.
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        route = mock.get("/webapi/entry.cgi").respond(200, json=list_payload)
+        result = await shares.shares_create(
+            "testhost", "Movies", "/volume1",
+            enable_recycle_bin=False, encryption=False,
+            app_context=app_ctx,
+        )
+
+    assert result["ok"] is True
+    assert result["data"]["created"] is False
+    assert "share already exists" in result["warnings"]
+    # ONLY the list call fired, not a second create call.
+    assert route.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_shares_create_refuses_when_same_name_different_volume(
+    app_ctx, fixture_json,
+) -> None:
+    """Same name on different volume → share_exists_with_different_config refusal."""
+    _seed_session(app_ctx)
+    list_payload = fixture_json("share", "list_normal.json")
+    # Movies exists on /volume1; caller asks for /volume2.
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        mock.get("/webapi/entry.cgi").respond(200, json=list_payload)
+        result = await shares.shares_create(
+            "testhost", "Movies", "/volume2", app_context=app_ctx,
+        )
+
+    assert result["ok"] is False
+    assert result["data"]["category"] == "share_exists_with_different_config"
+    assert any("volume" in m for m in result["data"]["mismatches"])
+
+
+@pytest.mark.asyncio
+async def test_shares_create_refuses_when_encryption_mismatch(
+    app_ctx, fixture_json,
+) -> None:
+    """Existing unencrypted Movies + caller asks encrypted → mismatch refusal."""
+    _seed_session(app_ctx)
+    list_payload = fixture_json("share", "list_normal.json")
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        mock.get("/webapi/entry.cgi").respond(200, json=list_payload)
+        result = await shares.shares_create(
+            "testhost", "Movies", "/volume1",
+            encryption=True, encryption_passphrase="hunter2hunter2",
+            app_context=app_ctx,
+        )
+
+    assert result["ok"] is False
+    assert result["data"]["category"] == "share_exists_with_different_config"
+    assert any("encryption" in m for m in result["data"]["mismatches"])
+
+
+@pytest.mark.asyncio
+async def test_shares_create_rejects_empty_name(app_ctx) -> None:
+    _seed_session(app_ctx)
+    with pytest.raises(InvalidParam):
+        await shares.shares_create(
+            "testhost", "", "/volume1", app_context=app_ctx,
+        )
+
+
+@pytest.mark.asyncio
+async def test_shares_create_rejects_bad_volume_path(app_ctx) -> None:
+    """Volume path that doesn't start with /volume → InvalidParam."""
+    _seed_session(app_ctx)
+    for bad in ["", "volume1", "/etc", "/home", "vol1"]:
+        with pytest.raises(InvalidParam):
+            await shares.shares_create(
+                "testhost", "Movies", bad, app_context=app_ctx,
+            )

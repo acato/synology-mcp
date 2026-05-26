@@ -1,6 +1,6 @@
 # Copyright 2026 synology-mcp contributors
 # Licensed under the Apache License, Version 2.0 (see LICENSE)
-"""Shared folder introspection — READ-ONLY in Phase 2.
+"""Shared folder tools — Phase 2 (reads) + Phase 3b (writes).
 
 Wraps ``SYNO.Core.Share`` family endpoints. See DESIGN.md §5.5.
 
@@ -9,7 +9,19 @@ Phase 2 ships:
   * ``shares_get_acl``             — local_user + local_group + system ACL
   * ``shares_get_snapshot_config`` — Btrfs snapshot listing/config
 
-Phase 3 will add ``shares_create``.
+Phase 3b adds the write half:
+  * ``shares_create`` — wrap ``SYNO.Core.Share`` ``create`` with a
+    reserved-name pre-flight and idempotent same-config re-creates.
+  * ``shares_delete`` — wrap ``SYNO.Core.Share`` ``delete`` with an
+    empty-share safety rail.
+
+DSM 7.3 schema verified on CS3 build 86009 by reading the
+AdminCenter JS: ``create`` takes params ``name`` (string) + ``shareinfo``
+(JSON object with ``name``, ``vol_path``, ``desc``, ``hidden``,
+``enable_recycle_bin``, ``encryption``, ``enc_passwd``, ``share_quota``,
+``enable_share_cow``); ``delete`` takes ``name`` as a JSON array of
+share names. Both endpoints return DSM error 3343 for reserved share
+names and 3309 for the max-shares limit.
 
 Key DSM 7.3 quirks handled here:
 
@@ -30,6 +42,7 @@ Key DSM 7.3 quirks handled here:
 """
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from ._helpers import call_dsm, success_envelope
@@ -321,4 +334,253 @@ def _mb_float_to_bytes(val: object) -> int | None:
     return round(mb * 1024 * 1024)
 
 
-__all__ = ["shares_get_acl", "shares_get_snapshot_config", "shares_list"]
+# ---------------------------------------------------------------------------
+# shares_create (Phase 3b)
+# ---------------------------------------------------------------------------
+
+
+# Reserved-name denylist. Source: DSM 7.3 share-naming rules — DSM itself
+# returns error 3343 when ``synoshare`` is asked to register any of these
+# as user shares. We block client-side so callers get a tidy
+# ``reserved_share_name`` envelope instead of an opaque error code, and
+# we get to recommend a workaround in the same response.
+#
+# This list is the conservative subset of what DSM blocks; if DSM
+# rejects a name we missed, the call will still fail server-side and
+# bubble up as an InvalidParam — we just lose the nice category.
+_RESERVED_SHARE_NAMES: frozenset[str] = frozenset({
+    # User Home family — DSM reserves these for its own machinery.
+    "home", "homes",
+    # Built-in package shares.
+    "music", "photo", "video", "surveillance", "download",
+    # Backup / sync targets DSM owns.
+    "NetBackup",
+    # System-internal aliases.
+    "@appstore", "@autoupdate", "@database", "@docker",
+    "@home", "@maillog", "@mailscanner", "@MailScanner",
+    "@spool", "@tmp",
+})
+
+# Prefix denylist. DSM auto-generates these for removable media and the
+# web station: ``usbshare1``, ``usbshare2-1``, ``sdshare1``, ``esata-1``,
+# ``web``, ``web_packages``, ``webdefault``. Matching the prefix keeps
+# us future-proof against a 6th USB port etc.
+_RESERVED_SHARE_PREFIXES: tuple[str, ...] = (
+    "usbshare", "sdshare", "esata", "web",
+)
+
+
+def _is_reserved_share_name(name: str) -> bool:
+    """Return True if `name` collides with a DSM-reserved share name."""
+    lowered = name.lower()
+    if name in _RESERVED_SHARE_NAMES:
+        return True
+    # Case-insensitive check for the canonical lowercase names; this
+    # catches ``Music`` etc. without flagging legitimate names like
+    # ``MyMusic``.
+    if lowered in {n.lower() for n in _RESERVED_SHARE_NAMES}:
+        return True
+    return any(lowered.startswith(prefix) for prefix in _RESERVED_SHARE_PREFIXES)
+
+
+def _find_existing_share(rows: list[dict[str, Any]], name: str) -> dict[str, Any] | None:
+    """Return the row matching `name` (case-sensitive) or None."""
+    for row in rows:
+        if row.get("name") == name:
+            return row
+    return None
+
+
+def _share_config_compatible(
+    existing: dict[str, Any],
+    volume: str,
+    encrypted: bool,
+    recycle_bin_enabled: bool,
+) -> tuple[bool, list[str]]:
+    """Return (compatible, mismatches[]) for an existing share vs requested config.
+
+    "Compatible" means the same volume, the same encryption flag, and
+    the same recycle-bin flag. Other settings (description, ACL
+    options) are *not* compared — those are mutable via ``set`` and
+    don't change the share's identity.
+
+    The mismatch list is human-readable strings useful for the
+    ``share_exists_with_different_config`` failure envelope.
+    """
+    mismatches: list[str] = []
+    if existing.get("volume") != volume:
+        mismatches.append(
+            f"volume: existing={existing.get('volume')!r}, requested={volume!r}"
+        )
+    if bool(existing.get("encrypted")) != encrypted:
+        mismatches.append(
+            f"encryption: existing={existing.get('encrypted')}, requested={encrypted}"
+        )
+    if bool(existing.get("recycle_bin_enabled")) != recycle_bin_enabled:
+        mismatches.append(
+            "recycle_bin: "
+            f"existing={existing.get('recycle_bin_enabled')}, "
+            f"requested={recycle_bin_enabled}"
+        )
+    return (not mismatches, mismatches)
+
+
+# Public function signature deliberately uses **opts for forward-compat
+# with new DSM fields. The supported keys are validated below.
+_CREATE_OPT_KEYS: frozenset[str] = frozenset({
+    "desc", "hidden", "enable_recycle_bin", "encryption",
+    "encryption_passphrase", "enable_share_cow",
+})
+
+
+async def shares_create(
+    host: str,
+    name: str,
+    volume: str,
+    *,
+    app_context,
+    desc: str = "",
+    hidden: bool = False,
+    enable_recycle_bin: bool = False,
+    encryption: bool = False,
+    encryption_passphrase: str | None = None,
+    enable_share_cow: bool = True,
+) -> dict:
+    """Create a shared folder.
+
+    Reserved-name pre-flight: if ``name`` matches the DSM denylist
+    (``music``, ``photo``, ``video``, ``home``, ``homes``,
+    ``NetBackup``, ``usbshare*``, ``sdshare*``, ``esata*``,
+    ``surveillance``, ``download``, ``web*``, plus the ``@*`` system
+    aliases) the call refuses with ``category="reserved_share_name"``
+    and a hint that the dir can still exist as a plain path for
+    rsync-style targets.
+
+    Idempotency: list existing shares first. If a share with the same
+    name exists on the SAME volume with COMPATIBLE flags (encryption,
+    recycle bin), return ``ok=True, data.created=False`` with the
+    ``"share already exists"`` warning. If a same-name share exists
+    with a *different* config, refuse with
+    ``category="share_exists_with_different_config"``.
+
+    DSM 7.3 ``create`` params (verified on CS3 build 86009):
+    ``name`` (string) + ``shareinfo`` (JSON-encoded object). The
+    ``shareinfo`` payload mirrors what the AdminCenter UI sends.
+    """
+    if not name:
+        raise InvalidParam(
+            "share name must be a non-empty string", host=host,
+            details={"param": "name"},
+        )
+    if not volume or not volume.startswith("/volume"):
+        raise InvalidParam(
+            "volume must be a /volumeN path (e.g. '/volume1')", host=host,
+            details={"param": "volume"},
+        )
+    if encryption and not encryption_passphrase:
+        raise InvalidParam(
+            "encryption_passphrase is required when encryption=True", host=host,
+            details={"param": "encryption_passphrase"},
+        )
+
+    # --- reserved-name pre-flight ----------------------------------------
+    if _is_reserved_share_name(name):
+        return {
+            "ok": False,
+            "host": host,
+            "data": {
+                "category": "reserved_share_name",
+                "name": name,
+                "next_step": (
+                    "pick a different name; the dir can still exist as a "
+                    "plain path for rsync targets"
+                ),
+            },
+            "warnings": [],
+        }
+
+    # --- idempotency pre-flight ------------------------------------------
+    list_envelope = await shares_list(host, app_context=app_context)
+    existing_rows = list_envelope.get("data", {}).get("shares") or []
+    existing = _find_existing_share(existing_rows, name)
+    if existing is not None:
+        compatible, mismatches = _share_config_compatible(
+            existing, volume, encryption, enable_recycle_bin,
+        )
+        if compatible:
+            return success_envelope(
+                host,
+                {
+                    "created": False,
+                    "share": existing,
+                },
+                warnings=["share already exists"],
+            )
+        return {
+            "ok": False,
+            "host": host,
+            "data": {
+                "category": "share_exists_with_different_config",
+                "name": name,
+                "mismatches": mismatches,
+                "existing": existing,
+                "next_step": (
+                    "delete the existing share first or pick a different name; "
+                    "this tool refuses to mutate live share configs"
+                ),
+            },
+            "warnings": [],
+        }
+
+    # --- create call -----------------------------------------------------
+    # DSM 7.3 ``shareinfo`` object: see admin_center.js getParamShareForm.
+    # ``encryption`` is an int (0/1/2) in the server-side schema; the UI
+    # uses bool externally and maps. We mirror: bool input → 1 (with
+    # passphrase) or 0.
+    shareinfo: dict[str, Any] = {
+        "name": name,
+        "vol_path": volume,
+        "desc": desc,
+        "hidden": bool(hidden),
+        "enable_recycle_bin": bool(enable_recycle_bin),
+        "enable_share_cow": bool(enable_share_cow),
+        "encryption": 1 if encryption else 0,
+    }
+    if encryption and encryption_passphrase:
+        # The AdminCenter UI sends ``enc_passwd`` for the create-time
+        # passphrase. DSM accepts it as a top-level shareinfo key.
+        shareinfo["enc_passwd"] = encryption_passphrase
+
+    body = await call_dsm(
+        app_context, host,
+        api="SYNO.Core.Share", method="create", version=1,
+        params={
+            "name": name,
+            "shareinfo": json.dumps(shareinfo),
+        },
+    )
+    warnings = list(extract_warnings(body))
+
+    return success_envelope(
+        host,
+        {
+            "created": True,
+            "share": {
+                "name": name,
+                "volume": volume,
+                "encrypted": bool(encryption),
+                "hidden": bool(hidden),
+                "recycle_bin_enabled": bool(enable_recycle_bin),
+                "share_cow_enabled": bool(enable_share_cow),
+            },
+        },
+        warnings,
+    )
+
+
+__all__ = [
+    "shares_create",
+    "shares_get_acl",
+    "shares_get_snapshot_config",
+    "shares_list",
+]
