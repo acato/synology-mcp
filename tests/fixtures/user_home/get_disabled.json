@@ -1,0 +1,15 @@
+{
+  "success": true,
+  "data": {
+    "enable": false,
+    "enable_domain": false,
+    "enable_ldap": false,
+    "enable_recycle_bin": false,
+    "encryption": 0,
+    "location": "/volume1",
+    "remote_location": "",
+    "userhome_in_s2s": false,
+    "userhome_is_tiering_bucket": false,
+    "userhome_is_tiering_share": false
+  }
+}
