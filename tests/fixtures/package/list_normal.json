@@ -1,0 +1,36 @@
+{
+  "success": true,
+  "data": {
+    "packages": [
+      {
+        "additional": { "install_type": "system" },
+        "id": "ActiveInsight",
+        "name": "Active Insight",
+        "timestamp": 1779000000000,
+        "version": "3.0.5-24122"
+      },
+      {
+        "additional": { "install_type": "" },
+        "id": "ContainerManager",
+        "name": "Container Manager",
+        "timestamp": 1779000000001,
+        "version": "24.0.2-1606"
+      },
+      {
+        "additional": { "install_type": "system" },
+        "id": "FileStation",
+        "name": "File Station",
+        "timestamp": 1779000000002,
+        "version": "1.4.3-1609"
+      },
+      {
+        "additional": { "install_type": "" },
+        "id": "SnapshotReplication",
+        "name": "Snapshot Replication",
+        "timestamp": 1779000000003,
+        "version": "7.4.7-1859"
+      }
+    ],
+    "total": 4
+  }
+}

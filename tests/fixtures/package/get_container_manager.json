@@ -1,0 +1,9 @@
+{
+  "success": true,
+  "data": {
+    "id": "ContainerManager",
+    "name": "Container Manager",
+    "timestamp": 1779000000001,
+    "version": "24.0.2-1606"
+  }
+}
