@@ -1,0 +1,22 @@
+{
+  "success": true,
+  "data": {
+    "plans": [
+      {
+        "plan_id": "PLAN-AAAA-BBBB-0001",
+        "plan_name": "movies-to-backup",
+        "solution_type": 1,
+        "main_site": { "hostname": "nas-primary.example.com", "ip": "192.0.2.10" },
+        "dr_site":   { "hostname": "nas-backup.example.com",  "ip": "192.0.2.20" },
+        "source_share": "Movies",
+        "dest_share":   "Movies",
+        "sync_mode": 1,
+        "role": "source",
+        "enabled": true,
+        "paused": false,
+        "status": "idle"
+      }
+    ],
+    "total": 1
+  }
+}
