@@ -27,6 +27,7 @@ from . import (
     raid,
     shares,
     snapshot_replication,
+    ssh,
     user_home,
 )
 from .config import Config, load_config
@@ -59,8 +60,10 @@ def build_app(config: Config | None = None) -> tuple[FastMCP, AppContext]:
             "All tools take a `host` parameter matching a host defined in "
             "the config file (`~/.config/synology-mcp/config.toml`) or via "
             "`SYNOLOGY_MCP_<HOST>_*` environment variables. "
-            "Phase 1 + 2 exposes auth, raid, network, packages, user_home, "
-            "shares, and snapshot_replication tools — all read-only."
+            "Phases 1+2 expose read-only auth, raid, network, packages, "
+            "user_home, shares, and snapshot_replication tools. Phase 3a "
+            "adds three SSH write tools (ssh_add_authorized_key, "
+            "ssh_remove_authorized_key, ssh_enable_user_ssh)."
         ),
     )
 
@@ -219,6 +222,52 @@ def build_app(config: Config | None = None) -> tuple[FastMCP, AppContext]:
             snapshot_replication.snapshot_replication_recent_activity(
                 host, limit=limit, app_context=ctx,
             )
+        )
+
+    # --- ssh (Phase 3a — WRITE tools) -------------------------------------
+
+    @mcp.tool(
+        description="Append a public key to ~user/.ssh/authorized_keys "
+        "on `host` (idempotent by SHA256 fingerprint of the key blob). "
+        "Pre-flight calls user_home_is_enabled and refuses if it returns "
+        "enabled=False. Uses base64-over-exec, NOT SFTP (DSM disables the "
+        "SFTP subsystem). Returns data.added (bool) and data.fingerprint "
+        "(SHA256:<b64>)."
+    )
+    async def ssh_add_authorized_key(
+        host: str, user: str, pubkey: str, comment: str = "",
+    ) -> dict:
+        return await _safe(
+            ssh.ssh_add_authorized_key(
+                host, user, pubkey, comment=comment, app_context=ctx,
+            )
+        )
+
+    @mcp.tool(
+        description="Remove all keys whose SHA256 fingerprint matches "
+        "`fingerprint` from ~user/.ssh/authorized_keys on `host`. "
+        "Idempotent — a fingerprint that isn't present returns ok=True "
+        "with data.removed_count=0. Order of remaining keys is preserved."
+    )
+    async def ssh_remove_authorized_key(
+        host: str, user: str, fingerprint: str,
+    ) -> dict:
+        return await _safe(
+            ssh.ssh_remove_authorized_key(
+                host, user, fingerprint, app_context=ctx,
+            )
+        )
+
+    @mcp.tool(
+        description="Grant SSH access to a DSM user by adding them to the "
+        "`administrators` group (DSM 7.3 has no per-user SSH app-priv "
+        "row — administrators-group membership is the gate). Idempotent: "
+        "users already in admin return warnings=['already enabled'] and "
+        "data.added=False."
+    )
+    async def ssh_enable_user_ssh(host: str, user: str) -> dict:
+        return await _safe(
+            ssh.ssh_enable_user_ssh(host, user, app_context=ctx)
         )
 
     return mcp, ctx
