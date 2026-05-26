@@ -1,15 +1,16 @@
 # Copyright 2026 synology-mcp contributors
 # Licensed under the Apache License, Version 2.0 (see LICENSE)
-"""SSH key + service management — Phase 3a (write tools).
+"""SSH key + service management — Phase 3a + Phase 3c (write tools).
 
 This module ships the write half of the ``ssh_*`` tool family:
 
   * :func:`ssh_add_authorized_key`    — Phase 3a.
   * :func:`ssh_remove_authorized_key` — Phase 3a.
-  * :func:`ssh_enable_user_ssh`       — Phase 3a, this commit.
+  * :func:`ssh_enable_user_ssh`       — Phase 3a.
+  * :func:`ssh_set_port`              — Phase 3c.
 
-Read-only ``ssh_get_state`` / ``ssh_list_authorized_keys`` and
-``ssh_set_port`` ship in a later phase.
+Read-only ``ssh_get_state`` / ``ssh_list_authorized_keys`` ship in a
+later phase.
 
 Key DSM 7.3 quirks handled here
 -------------------------------
@@ -588,8 +589,300 @@ def _extract_is_admin(body: dict[str, Any], user: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Tool: ssh_set_port (Phase 3c)
+# ---------------------------------------------------------------------------
+
+
+# Port-validation thresholds
+_MIN_USER_PORT = 1024
+_MAX_PORT = 65535
+_DEFAULT_SSH_PORT = 22
+
+# Verification timeout for the new-port handshake. 10s is plenty for a
+# DSM unit on a LAN; on a slow remote NAS we'd rather report
+# ``verified=False`` (with the user's existing session intact as the
+# escape hatch) than block the caller indefinitely.
+_NEW_PORT_VERIFY_TIMEOUT = 10.0
+
+
+def _validate_port(port: int, *, allow_default: bool, host: str | None = None) -> None:
+    """Reject ports that fall outside the user range, with a port-22 carve-out.
+
+    Port 22 specifically is refused unless the caller opts in via
+    ``allow_default=True`` because it's a security-bad default we don't
+    want anyone landing on by accident — every Synology-aimed scanner
+    out there hits 22 first.
+    """
+    if not isinstance(port, int) or isinstance(port, bool):
+        raise InvalidParam(
+            "port must be an integer", host=host,
+            details={"param": "port"},
+        )
+    if port == _DEFAULT_SSH_PORT:
+        if not allow_default:
+            raise InvalidParam(
+                "port 22 is the well-known SSH default and is refused unless "
+                "allow_default=True is passed explicitly",
+                host=host,
+                details={"param": "port", "value": port},
+            )
+        return
+    if port < _MIN_USER_PORT or port > _MAX_PORT:
+        raise InvalidParam(
+            f"port must be in [{_MIN_USER_PORT}, {_MAX_PORT}] "
+            f"(or 22 with allow_default=True); got {port}",
+            host=host,
+            details={"param": "port", "value": port},
+        )
+
+
+async def _detect_port_in_use(ssh: DSMSshClient, port: int) -> bool:
+    """Return True iff some other listener is already bound to `port` on the host.
+
+    Uses ``ss -lnt 'sport = :<port>'`` — busybox-ss on DSM supports the
+    sport filter. If ss is unavailable we fall back to ``netstat -lnt``
+    + a literal grep. Either way the contract is: TRUE means we saw an
+    LISTEN row matching the port, FALSE means we did not.
+    """
+    cmd = (
+        f"ss -lnt 'sport = :{port}' 2>/dev/null | "
+        f"awk 'NR>1 && /LISTEN/ {{print $0}}' | head -1"
+    )
+    try:
+        res = await ssh.run(cmd, check=False, timeout=10.0)
+    except DSMSshError:
+        # Fallback: netstat (busybox).
+        try:
+            res = await ssh.run(
+                f"netstat -lnt 2>/dev/null | "
+                f"awk '/LISTEN/ && $4 ~ /:{port}$/ {{print $0}}' | head -1",
+                check=False, timeout=10.0,
+            )
+        except DSMSshError:
+            # If both probes fail we err on the safe side and call the
+            # port free — the DSM set call will fail loudly on the
+            # server side if we got it wrong.
+            return False
+    return bool(res.stdout.strip())
+
+
+def _terminal_set_payload(current: dict[str, Any], new_port: int) -> dict[str, Any]:
+    """Build the ``SYNO.Core.Terminal.set`` params from the current state + new port.
+
+    DSM 7.3.2's set endpoint demands the full configuration round-trip:
+    enable_ssh, enable_telnet, forbid_console, ssh_port, plus the
+    cipher/kex/mac arrays. We pass everything through unchanged except
+    ssh_port so we don't accidentally disable any setting as a
+    side-effect (see DESIGN.md §5.7 for the carry-forward rationale).
+
+    ``current`` is the ``data`` sub-object from ``SYNO.Core.Terminal.get``.
+    """
+    payload: dict[str, Any] = {
+        "enable_ssh": "true" if current.get("enable_ssh") else "false",
+        "ssh_port": str(int(new_port)),
+    }
+    if "enable_telnet" in current:
+        payload["enable_telnet"] = (
+            "true" if current.get("enable_telnet") else "false"
+        )
+    if "forbid_console" in current:
+        payload["forbid_console"] = (
+            "true" if current.get("forbid_console") else "false"
+        )
+    # The cipher/kex/mac arrays — DSM accepts them JSON-encoded.
+    for key in ("ssh_cipher", "ssh_kex", "ssh_mac"):
+        arr = current.get(key)
+        if isinstance(arr, list):
+            payload[key] = json.dumps(arr)
+    return payload
+
+
+def _verify_ssh_on_port_sync(
+    host_cfg: Any,
+    port: int,
+    password: str | None,
+    timeout: float = _NEW_PORT_VERIFY_TIMEOUT,
+) -> tuple[bool, str | None]:
+    """Open a FRESH paramiko handshake to `host_cfg.ip:port` and close it.
+
+    Returns ``(ok, error_message)``. We do not reuse the cached client
+    because the whole point of the verify step is to prove the new port
+    works from a CLEAN connection. The session is closed immediately
+    after the handshake — we only need to know the daemon accepted us.
+
+    Runs synchronously (paramiko blocks); the async caller offloads to
+    a thread.
+    """
+    import paramiko  # local import keeps the module's import surface narrow
+
+    client = paramiko.SSHClient()
+    # No known_hosts file is fine for verify — the cached client
+    # already enforces the system policy, this fresh handshake is
+    # only checking "does the daemon answer".
+    with contextlib.suppress(OSError):
+        client.load_system_host_keys()
+    connect_kwargs: dict[str, Any] = {
+        "hostname": host_cfg.ip,
+        "port": port,
+        "username": host_cfg.effective_ssh_username,
+        "timeout": timeout,
+        "auth_timeout": timeout,
+        "banner_timeout": timeout,
+        "allow_agent": True,
+        "look_for_keys": True,
+    }
+    if host_cfg.ssh_key_path:
+        connect_kwargs["key_filename"] = host_cfg.ssh_key_path
+    if password:
+        connect_kwargs["password"] = password
+    try:
+        client.connect(**connect_kwargs)
+    except (OSError, paramiko.SSHException) as exc:
+        with contextlib.suppress(Exception):  # pragma: no cover - best effort
+            client.close()
+        return False, str(exc)
+    with contextlib.suppress(Exception):  # pragma: no cover - best effort
+        client.close()
+    return True, None
+
+
+async def _verify_ssh_on_port(
+    host_cfg: Any, port: int, password: str | None,
+) -> tuple[bool, str | None]:
+    """Async wrapper around :func:`_verify_ssh_on_port_sync`."""
+    import asyncio
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, _verify_ssh_on_port_sync, host_cfg, port, password,
+        _NEW_PORT_VERIFY_TIMEOUT,
+    )
+
+
+async def ssh_set_port(
+    host: str, port: int, allow_default: bool = False, *, app_context,
+) -> dict:
+    """Change DSM's SSH listen port to `port`, with pre-flight + post-verify.
+
+    Pre-flight:
+
+      1. ``port`` must be in [1024, 65535] unless ``allow_default=True``
+         is passed for port 22 (refused by default — port 22 is a
+         security-bad target that every Synology-aimed scanner hits).
+      2. ``ss -lnt`` over SSH MUST NOT find a LISTEN row on ``port``.
+         If a different listener already has the port, refuse with
+         ``category="port_already_in_use"``.
+      3. If the current SSH port already equals ``port``, short-circuit
+         with ``ok=True, data.changed=False, warnings=["already on this
+         port"]``. No mutation, no verify step.
+
+    Mutation: read the current ``SYNO.Core.Terminal.get`` state, mutate
+    only ``ssh_port``, and send the FULL payload back via ``set``.
+    DSM's set endpoint requires the round-trip; sending a partial
+    payload risks disabling other settings as a side-effect.
+
+    Post-change verification: open a NEW paramiko handshake to
+    ``<host>:<new_port>``, 10s timeout. We do NOT revert if verify
+    fails — the existing SSH session is the user's escape hatch and
+    reverting would just compound the confusion. On verify-failure we
+    return ``ok=True, data.changed=True, data.verified=False`` with a
+    warning explaining the situation.
+
+    Returns ``data = {old_port, new_port, changed: bool,
+    verified: bool}`` plus the standard envelope.
+    """
+    _validate_port(port, allow_default=allow_default, host=host)
+
+    # --- Pre-flight 1: read current Terminal state ---------------------------
+    body = await call_dsm(
+        app_context, host,
+        api="SYNO.Core.Terminal", method="get", version=3,
+    )
+    current = body.get("data") or {}
+    current_port = _int_or_none(current.get("ssh_port"))
+    warnings: list[str] = list(extract_warnings(body))
+
+    # --- Pre-flight 2: idempotency -------------------------------------------
+    if current_port == port:
+        warnings.insert(0, "already on this port")
+        return success_envelope(
+            host,
+            {
+                "changed": False,
+                "verified": True,
+                "old_port": current_port,
+                "new_port": port,
+            },
+            warnings,
+        )
+
+    # --- Pre-flight 3: port-in-use probe -------------------------------------
+    ssh = get_ssh_client(app_context, host)
+    if await _detect_port_in_use(ssh, port):
+        return {
+            "ok": False,
+            "host": host,
+            "data": {
+                "category": "port_already_in_use",
+                "port": port,
+                "next_step": (
+                    "pick a different port; the host already has a LISTEN "
+                    "socket on this one"
+                ),
+            },
+            "warnings": warnings,
+        }
+
+    # --- Mutation ------------------------------------------------------------
+    set_params = _terminal_set_payload(current, port)
+    set_body = await call_dsm(
+        app_context, host,
+        api="SYNO.Core.Terminal", method="set", version=3,
+        params=set_params,
+    )
+    warnings.extend(extract_warnings(set_body))
+
+    # --- Post-change verify (fresh paramiko handshake) -----------------------
+    host_cfg = app_context.config.get_host(host)
+    verified, verify_err = await _verify_ssh_on_port(
+        host_cfg, port, host_cfg.password,
+    )
+    if not verified:
+        warnings.append(
+            f"new port {port} did not respond within "
+            f"{int(_NEW_PORT_VERIFY_TIMEOUT)}s — verify firewall and "
+            "connectivity in a SEPARATE session before closing your "
+            f"existing one (error: {verify_err})"
+        )
+
+    return success_envelope(
+        host,
+        {
+            "changed": True,
+            "verified": verified,
+            "old_port": current_port,
+            "new_port": port,
+        },
+        warnings,
+    )
+
+
+def _int_or_none(val: object) -> int | None:
+    """Coerce DSM's mixed-int-or-string port values to an int."""
+    if val is None or val == "":
+        return None
+    try:
+        return int(val)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        try:
+            return int(float(val))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+
+
 __all__ = [
     "ssh_add_authorized_key",
     "ssh_enable_user_ssh",
     "ssh_remove_authorized_key",
+    "ssh_set_port",
 ]
