@@ -936,8 +936,12 @@ async def packages_uninstall(
     warnings=["package not installed"]`` — no API call fires.
 
     DSM 7.3 uses ``SYNO.Core.Package.Uninstallation`` v1 with method
-    ``uninstall`` and a ``package`` param. The async completion shape
-    mirrors ``Installation`` so we use the same poll loop.
+    ``uninstall``. The param name is ``id`` (NOT ``package``), per the
+    AdminCenter PkgManApp.js call site:
+    ``params: {id: t.id, dsm_apps: t.get("dsm_apps")}``. The DSM
+    server returns 120 when sent ``package=<id>`` — same surprise we
+    hit on the install verb. The async completion shape mirrors
+    ``Installation`` so we use the same poll loop.
     """
     if not package_id:
         raise InvalidParam(
@@ -984,7 +988,7 @@ async def packages_uninstall(
         app_context, host,
         api="SYNO.Core.Package.Uninstallation",
         method="uninstall", version=1,
-        params={"package": package_id},
+        params={"id": package_id},
     )
     warnings.extend(extract_warnings(body))
     data = body.get("data") or {}
