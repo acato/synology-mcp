@@ -24,9 +24,20 @@ from .transport.ssh import DSMSshClient
 
 
 def _normalize_iface_web(raw: dict[str, Any]) -> dict[str, Any]:
-    """Map DSM's web-API NIC entry to canonical schema."""
+    """Map DSM's web-API NIC entry to canonical schema.
+
+    DSM 7.3 returns `ifname`, `ip`+`mask`, `speed`, `status`
+    ("connected"/"disconnected"), `type` ("lan"/"pppoe"). MAC + MTU are NOT in
+    this payload; they come from sysfs in :func:`_merge_iface`.
+    """
     return {
-        "name": str(raw.get("id") or raw.get("device") or raw.get("name") or ""),
+        "name": str(
+            raw.get("ifname")
+            or raw.get("id")
+            or raw.get("device")
+            or raw.get("name")
+            or ""
+        ),
         "mac": str(raw.get("mac") or raw.get("hwaddr") or "").lower(),
         "mtu": _int_or_none(raw.get("mtu")),
         "ips": _extract_ips(raw),
@@ -64,6 +75,20 @@ def _normalize_state(raw: object) -> str:
     if s in {"down", "disconnected", "0", "inactive"}:
         return "down"
     return s
+
+
+def _extract_web_interface_list(body: dict[str, Any]) -> list[dict[str, Any]]:
+    """DSM returns ``data`` as a top-level list of interfaces in 7.3.
+    Older builds wrap them under ``data.interfaces`` / ``data.ifaces``."""
+    data = body.get("data")
+    if isinstance(data, list):
+        return [d for d in data if isinstance(d, dict)]
+    if isinstance(data, dict):
+        for key in ("interfaces", "ifaces", "items"):
+            inner = data.get(key)
+            if isinstance(inner, list):
+                return [d for d in inner if isinstance(d, dict)]
+    return []
 
 
 # ----- SSH /sys/class/net cross-check --------------------------------------
@@ -134,11 +159,8 @@ async def network_list_interfaces(host: str, *, app_context) -> dict:
         app_context, host,
         api="SYNO.Core.Network.Interface", method="list", version=1,
     )
-    data = body.get("data") or {}
-    raw_list = data.get("interfaces") or data.get("ifaces") or data.get("items") or []
-    if not isinstance(raw_list, list):
-        raw_list = []
-    web_ifaces = [_normalize_iface_web(i) for i in raw_list if isinstance(i, dict)]
+    raw_list = _extract_web_interface_list(body)
+    web_ifaces = [_normalize_iface_web(i) for i in raw_list]
     # Cross-check via sysfs over SSH.
     ssh = get_ssh_client(app_context, host)
     merged: list[dict[str, Any]] = []

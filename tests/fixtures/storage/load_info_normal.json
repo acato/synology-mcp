@@ -1,0 +1,84 @@
+{
+  "success": true,
+  "data": {
+    "volumes": [
+      {
+        "id": "volume_1",
+        "vol_path": "/volume1",
+        "fs_type": "btrfs",
+        "device_type": "shr_with_2_disk_protect",
+        "is_encrypted": false,
+        "pool_path": "reuse_1",
+        "raidType": "multiple",
+        "size": {
+          "total": "57540851269632",
+          "used": "25711839268864",
+          "total_device": "59938416099328"
+        },
+        "status": "has_acceptable_disk",
+        "space_status": {
+          "status": "fs_normal"
+        }
+      },
+      {
+        "id": "volume_2",
+        "vol_path": "/volume2",
+        "fs_type": "ext4",
+        "device_type": "raid_1",
+        "is_encrypted": true,
+        "pool_path": "reuse_2",
+        "size": {
+          "total": "1000000000000",
+          "used": "250000000000"
+        },
+        "status": "normal"
+      }
+    ],
+    "disks": [
+      {
+        "id": "sata1",
+        "name": "Drive 1",
+        "model": "HUH721010ALE600",
+        "serial": "REDACTED_SERIAL_1",
+        "ui_serial": "REDACTED_SERIAL_1",
+        "size_total": "10000831348736",
+        "smart_status": "normal",
+        "status": "normal",
+        "temp": 33,
+        "container": { "type": "internal" },
+        "vendor": "HGST    "
+      },
+      {
+        "id": "sata2",
+        "name": "Drive 2",
+        "model": "HUH721010ALE600",
+        "serial": "REDACTED_SERIAL_2",
+        "ui_serial": "REDACTED_SERIAL_2",
+        "size_total": "10000831348736",
+        "smart_status": "warning",
+        "status": "normal",
+        "temp": 38,
+        "container": { "type": "internal" }
+      }
+    ],
+    "storagePools": [
+      {
+        "id": "reuse_1",
+        "device_type": "shr_with_2_disk_protect",
+        "raidType": "multiple",
+        "container": "internal",
+        "disks": ["sata1", "sata2", "sata3", "sata4", "sata5", "sata6", "sata7", "sata8"]
+      },
+      {
+        "id": "reuse_2",
+        "device_type": "raid_1",
+        "container": "internal",
+        "disks": ["nvme0n1", "nvme1n1"]
+      }
+    ],
+    "sharedCaches": [],
+    "ssdCaches": [],
+    "missing_pools": [],
+    "detected_pools": []
+  }
+}

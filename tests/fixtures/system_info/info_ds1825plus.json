@@ -3,30 +3,19 @@
   "data": {
     "model": "DS1825+",
     "serial": "REDACTED_SERIAL_NAS",
-    "firmware_ver": "DSM 7.3-86009",
-    "buildnumber": "86009",
-    "cpu_family": "AMD Ryzen V1500B",
-    "cpu_cores": 4,
-    "ram": 17179869184,
-    "nic": [
-      {
-        "name": "eth0",
-        "mac": "00:00:5E:00:53:01",
-        "speed": 1000,
-        "ip": "192.0.2.10"
-      },
-      {
-        "name": "eth1",
-        "mac": "00:00:5E:00:53:02",
-        "speed": 1000,
-        "ip": ""
-      },
-      {
-        "name": "eth2",
-        "mac": "00:00:5E:00:53:03",
-        "speed": 10000,
-        "ip": "192.0.2.20"
-      }
-    ]
+    "firmware_ver": "DSM 7.3.2-86009 Update 3",
+    "firmware_date": "2026/03/17",
+    "cpu_vendor": "AMD",
+    "cpu_family": "Ryzen",
+    "cpu_series": "V1500B",
+    "cpu_clock_speed": 2200,
+    "cpu_cores": "4",
+    "ram_size": 8192,
+    "enabled_ntp": true,
+    "ntp_server": "time.google.com",
+    "time_zone": "Pacific",
+    "sata_dev": [],
+    "usb_dev": [],
+    "up_time": "100:00:00"
   }
 }

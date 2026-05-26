@@ -70,7 +70,7 @@ def test_parse_mdstat_degraded(fixture_text) -> None:
 @pytest.mark.asyncio
 async def test_raid_list_volumes_success(app_ctx, fixture_json) -> None:
     _seed_session(app_ctx)
-    payload = fixture_json("storage_volume", "list_normal.json")
+    payload = fixture_json("storage", "load_info_normal.json")
     with respx.mock(base_url="https://192.0.2.10:5001") as mock:
         mock.get("/webapi/entry.cgi").respond(200, json=payload)
         result = await raid.raid_list_volumes("testhost", app_context=app_ctx)
@@ -78,20 +78,24 @@ async def test_raid_list_volumes_success(app_ctx, fixture_json) -> None:
     volumes = result["data"]["volumes"]
     assert len(volumes) == 2
     vol1 = volumes[0]
-    assert vol1["name"] == "Volume 1"
+    assert vol1["name"] == "/volume1"
     assert vol1["fs"] == "btrfs"
-    assert vol1["size_total_bytes"] == 23456789012345
-    assert vol1["size_used_bytes"] == 12345678901234
-    assert vol1["size_free_bytes"] == 23456789012345 - 12345678901234
-    assert vol1["raid_level"] == "raid6"
+    assert vol1["size_total_bytes"] == 57540851269632
+    assert vol1["size_used_bytes"] == 25711839268864
+    assert vol1["size_free_bytes"] == 57540851269632 - 25711839268864
+    # device_type ("multiple") on the volume is overridden by the pool's value.
+    assert vol1["raid_level"] == "shr_with_2_disk_protect"
     assert vol1["encrypted"] is False
-    assert vol1["status"] == "normal"
+    vol2 = volumes[1]
+    assert vol2["raid_level"] == "raid_1"
+    assert vol2["encrypted"] is True
+    assert vol2["fs"] == "ext4"
 
 
 @pytest.mark.asyncio
 async def test_raid_list_volumes_permission_denied(app_ctx, fixture_json) -> None:
     _seed_session(app_ctx)
-    payload = fixture_json("storage_volume", "list_permission_denied.json")
+    payload = fixture_json("storage", "load_info_permission_denied.json")
     with respx.mock(base_url="https://192.0.2.10:5001") as mock:
         mock.get("/webapi/entry.cgi").respond(200, json=payload)
         with pytest.raises(PermissionDenied) as exc_info:
@@ -105,23 +109,24 @@ async def test_raid_list_volumes_permission_denied(app_ctx, fixture_json) -> Non
 @pytest.mark.asyncio
 async def test_raid_list_disks_success(app_ctx, fixture_json) -> None:
     _seed_session(app_ctx)
-    payload = fixture_json("storage_hddman", "enumerate_normal.json")
+    payload = fixture_json("storage", "load_info_normal.json")
     with respx.mock(base_url="https://192.0.2.10:5001") as mock:
         mock.get("/webapi/entry.cgi").respond(200, json=payload)
         result = await raid.raid_list_disks("testhost", app_context=app_ctx)
     disks = result["data"]["disks"]
     assert len(disks) == 2
-    assert disks[0]["slot"] == "sda"
-    assert disks[0]["model"] == "WD80EFAX-00"
+    assert disks[0]["slot"] == "sata1"
+    assert disks[0]["model"] == "HUH721010ALE600"
     assert disks[0]["smart_state"] == "healthy"
-    assert disks[0]["temperature_c"] == 38
+    assert disks[0]["temperature_c"] == 33
+    assert disks[0]["role"] == "internal"
     assert disks[1]["smart_state"] == "warning"
 
 
 @pytest.mark.asyncio
 async def test_raid_list_disks_unsupported_method(app_ctx, fixture_json) -> None:
     _seed_session(app_ctx)
-    payload = fixture_json("storage_hddman", "enumerate_unsupported_method.json")
+    payload = fixture_json("storage", "load_info_unsupported.json")
     with respx.mock(base_url="https://192.0.2.10:5001") as mock:
         mock.get("/webapi/entry.cgi").respond(200, json=payload)
         with pytest.raises(UnsupportedDSMVersion):
@@ -134,18 +139,29 @@ async def test_raid_list_disks_unsupported_method(app_ctx, fixture_json) -> None
 @pytest.mark.asyncio
 async def test_raid_hardware_info_success(app_ctx, fixture_json) -> None:
     _seed_session(app_ctx)
-    payload = fixture_json("system_info", "info_ds1825plus.json")
+    sys_payload = fixture_json("system_info", "info_ds1825plus.json")
+    nic_payload = fixture_json("network_interface", "list_normal.json")
     with respx.mock(base_url="https://192.0.2.10:5001") as mock:
-        mock.get("/webapi/entry.cgi").respond(200, json=payload)
+        # First call -> system info, second call -> network interface list.
+        mock.get("/webapi/entry.cgi").mock(
+            side_effect=[
+                httpx.Response(200, json=sys_payload),
+                httpx.Response(200, json=nic_payload),
+            ]
+        )
         result = await raid.raid_hardware_info("testhost", app_context=app_ctx)
     data = result["data"]
     assert data["model"] == "DS1825+"
-    assert data["dsm_version"] == "DSM 7.3-86009"
+    assert data["dsm_version"] == "DSM 7.3.2-86009 Update 3"
     assert data["dsm_build"] == "86009"
+    assert data["cpu_model"] == "AMD Ryzen V1500B"
     assert data["cpu_cores"] == 4
-    assert data["ram_total_bytes"] == 17179869184
-    assert len(data["nics"]) == 3
-    assert data["nics"][0]["name"] == "eth0"
+    # ram_size=8192 MB -> 8 GiB in bytes
+    assert data["ram_total_bytes"] == 8192 * 1024 * 1024
+    # NIC table pulled from the network endpoint (top-level list shape).
+    assert len(data["nics"]) >= 3
+    eth0 = next(n for n in data["nics"] if n["name"] == "eth0")
+    assert eth0["status"] == "connected"
 
 
 # ---------- raid_state (mdstat over SSH) ------------------------------------
@@ -155,7 +171,6 @@ async def test_raid_hardware_info_success(app_ctx, fixture_json) -> None:
 async def test_raid_state_uses_ssh_and_parser(app_ctx, fixture_text) -> None:
     _seed_session(app_ctx)
     text = fixture_text("proc_mdstat", "resyncing.txt")
-    # Inject a stub SSH client whose `run()` returns the canned stdout.
     fake_ssh = MagicMock(spec=DSMSshClient)
     fake_ssh.run = AsyncMock(
         return_value=SshResult(

@@ -445,17 +445,17 @@ A host with `ip` but no `password` (and no `ssh_key_path` for SSH-only tools) wi
 | `shares_create` | `SYNO.Core.Share` `create` |
 | `shares_get_acl` | `SYNO.Core.Share.Permission` `list` (decoded) |
 | `shares_get_snapshot_config` | `SYNO.Core.Share.Snapshot` `get_config` |
-| `raid_list_volumes` | `SYNO.Storage.CGI.Volume` `list` |
-| `raid_list_disks` | `SYNO.Storage.CGI.HddMan` `enumerate` |
+| `raid_list_volumes` | `SYNO.Storage.CGI.Storage` `load_info` (unified payload — `data.volumes[]` + `data.storagePools[]` for pool device_type) |
+| `raid_list_disks` | `SYNO.Storage.CGI.Storage` `load_info` (same unified payload — `data.disks[]`) |
 | `raid_state` | SSH `cat /proc/mdstat` (parsed) |
-| `raid_hardware_info` | `SYNO.Core.System.Info` `get` + `SYNO.Core.System.Utilization` for RAM total |
+| `raid_hardware_info` | `SYNO.Core.System` `info` (model/serial/cpu/ram_size in MB) + `SYNO.Core.Network.Interface` `list` for the NIC table |
 | `ssh_get_state` | `SYNO.Core.Terminal` `get` + `SYNO.Core.Group.Member` for SSH group |
 | `ssh_set_port` | `SYNO.Core.Terminal` `set` |
 | `ssh_enable_user_ssh` | `SYNO.Core.Group.Member` add to `administrators`-equivalent or per-app permission |
 | `ssh_add_authorized_key` | SSH `printf %s '<b64>' | base64 -d >> ~/.ssh/authorized_keys` (NO SFTP — see §10) |
 | `ssh_list_authorized_keys` | SSH `cat ~/.ssh/authorized_keys` + parsing |
 | `ssh_remove_authorized_key` | SSH read + filter + write (atomic via `mv tmp final`) |
-| `network_list_interfaces` | `SYNO.Core.Network.Interface` `list` + SSH `cat /sys/class/net/*/{address,speed,operstate,mtu}` |
+| `network_list_interfaces` | `SYNO.Core.Network.Interface` `list` (returns `data` as a top-level list with `ifname`/`ip`/`mask`/`speed`/`status`) + SSH `cat /sys/class/net/<if>/{address,speed,operstate,mtu,duplex,carrier}` |
 | `network_get_interface` | same plus `ethtool` over SSH |
 
 ---

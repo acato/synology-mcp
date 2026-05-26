@@ -36,19 +36,6 @@ def _make_sysfs_reply(name: str, *, speed: int, operstate: str = "up",
     )
 
 
-def _ssh_run_dispatcher(replies: dict[str, str]) -> AsyncMock:
-    """Build an SSH `run` AsyncMock that picks the reply by command-prefix match."""
-    async def _side(command, *_, **__):
-        for prefix, stdout in replies.items():
-            if command.startswith(prefix):
-                return SshResult(
-                    command=command, stdout=stdout, stderr="", exit_status=0,
-                )
-        return SshResult(command=command, stdout="", stderr="", exit_status=1)
-    mock = AsyncMock(side_effect=_side)
-    return mock
-
-
 # ---------- network_list_interfaces ----------------------------------------
 
 
@@ -58,14 +45,15 @@ async def test_network_list_interfaces_merges_web_and_sysfs(
 ) -> None:
     _seed_session(app_ctx)
     payload = fixture_json("network_interface", "list_normal.json")
-    # Build per-interface sysfs replies (commands are `echo address=$(cat ...); echo speed=$(...)`).
-    # Each iface produces one command starting with `echo address=...`.
-    # Order: eth0 (up, 1000), eth1 (down, -1), eth2 (up, 10000)
+    # 4 entries in the fixture (eth0, eth1, eth2, pppoe) -> 4 sysfs replies.
     fake_ssh = MagicMock(spec=DSMSshClient)
     sysfs_iter = iter([
         _make_sysfs_reply("eth0", speed=1000, operstate="up", mac="00:00:5e:00:53:01"),
-        _make_sysfs_reply("eth1", speed=-1, operstate="down", mac="00:00:5e:00:53:02", carrier=0),
-        _make_sysfs_reply("eth2", speed=10000, operstate="up", mac="00:00:5e:00:53:03", mtu=9000),
+        _make_sysfs_reply("eth1", speed=-1, operstate="down",
+                          mac="00:00:5e:00:53:02", carrier=0),
+        _make_sysfs_reply("eth2", speed=10000, operstate="up",
+                          mac="00:00:5e:00:53:03", mtu=9000),
+        _make_sysfs_reply("pppoe", speed=0, operstate="down", carrier=0),
     ])
 
     async def _run(command, *_, **__):
@@ -80,7 +68,7 @@ async def test_network_list_interfaces_merges_web_and_sysfs(
         result = await network.network_list_interfaces("testhost", app_context=app_ctx)
 
     interfaces = result["data"]["interfaces"]
-    assert len(interfaces) == 3
+    assert len(interfaces) == 4
     eth0 = next(i for i in interfaces if i["name"] == "eth0")
     assert eth0["state"] == "up"
     assert eth0["speed_mbps"] == 1000
@@ -89,7 +77,7 @@ async def test_network_list_interfaces_merges_web_and_sysfs(
     assert "192.0.2.10" in eth0["ips"]
     eth1 = next(i for i in interfaces if i["name"] == "eth1")
     assert eth1["state"] == "down"
-    # sysfs says -1, web says 0; both invalid -> None.
+    # sysfs says -1 (down); web says -1 too -> None.
     assert eth1["speed_mbps"] is None
     eth2 = next(i for i in interfaces if i["name"] == "eth2")
     assert eth2["state"] == "up"
@@ -115,11 +103,10 @@ async def test_network_list_interfaces_handles_ssh_failure_gracefully(
     with respx.mock(base_url="https://192.0.2.10:5001") as mock:
         mock.get("/webapi/entry.cgi").respond(200, json=payload)
         result = await network.network_list_interfaces("testhost", app_context=app_ctx)
-    # We still get 3 interfaces; their speed comes from the web API.
+    # We still get 4 interfaces; their speed comes from the web API.
     interfaces = result["data"]["interfaces"]
-    assert len(interfaces) == 3
+    assert len(interfaces) == 4
     eth0 = next(i for i in interfaces if i["name"] == "eth0")
-    # web payload says speed=1000, status=up
     assert eth0["speed_mbps"] == 1000
     assert eth0["state"] == "up"
 
@@ -136,6 +123,7 @@ async def test_network_get_interface_includes_ethtool(app_ctx, fixture_json) -> 
         _make_sysfs_reply("eth0", speed=1000),
         _make_sysfs_reply("eth1", speed=-1, operstate="down", carrier=0),
         _make_sysfs_reply("eth2", speed=10000, mtu=9000),
+        _make_sysfs_reply("pppoe", speed=0, operstate="down", carrier=0),
     ])
     ethtool_stdout = (
         "driver: i40e\n"
@@ -168,7 +156,12 @@ async def test_network_get_interface_unknown_name(app_ctx, fixture_json) -> None
     _seed_session(app_ctx)
     payload = fixture_json("network_interface", "list_normal.json")
     fake_ssh = MagicMock(spec=DSMSshClient)
-    fake_ssh.run = _ssh_run_dispatcher({"echo address": _make_sysfs_reply("xxx", speed=0)})
+    fake_ssh.run = AsyncMock(
+        return_value=SshResult(
+            command="echo", stdout=_make_sysfs_reply("xxx", speed=0),
+            stderr="", exit_status=0,
+        )
+    )
     app_ctx.cache.get("testhost").ssh_client = fake_ssh
 
     with respx.mock(base_url="https://192.0.2.10:5001") as mock:
