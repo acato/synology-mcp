@@ -65,7 +65,10 @@ def build_app(config: Config | None = None) -> tuple[FastMCP, AppContext]:
             "adds three SSH write tools (ssh_add_authorized_key, "
             "ssh_remove_authorized_key, ssh_enable_user_ssh). Phase 3b "
             "adds four filesystem-write tools (user_home_enable, "
-            "user_home_disable, shares_create, shares_delete)."
+            "user_home_disable, shares_create, shares_delete). Phase 3c "
+            "adds three system-mutation tools (ssh_set_port, "
+            "packages_install, packages_uninstall) with denylist + EULA "
+            "+ port-in-use safety rails."
         ),
     )
 
@@ -351,6 +354,77 @@ def build_app(config: Config | None = None) -> tuple[FastMCP, AppContext]:
     async def ssh_enable_user_ssh(host: str, user: str) -> dict:
         return await _safe(
             ssh.ssh_enable_user_ssh(host, user, app_context=ctx)
+        )
+
+    # --- Phase 3c — system-mutation tools ---------------------------------
+
+    @mcp.tool(
+        description="Change DSM's SSH listen port via SYNO.Core.Terminal.set. "
+        "Pre-flight: port must be in [1024, 65535] unless port=22 with "
+        "allow_default=True (port 22 is refused by default — it's a "
+        "security-bad target). Refuses with category=port_already_in_use "
+        "if `ss -lnt sport = :<port>` finds another listener on the host. "
+        "Idempotent: same-port short-circuits with data.changed=False. "
+        "Reads SYNO.Core.Terminal.get v3 and rewrites the full payload "
+        "(carries forward enable_ssh/telnet/console + cipher/kex/mac "
+        "arrays) so .set never disables other settings as a side-effect. "
+        "Post-change: opens a fresh paramiko handshake on the new port "
+        "(10s timeout). Failure does NOT revert (the existing SSH session "
+        "is the escape hatch); surfaces data.verified=False with a warning."
+    )
+    async def ssh_set_port(
+        host: str, port: int, allow_default: bool = False,
+    ) -> dict:
+        return await _safe(
+            ssh.ssh_set_port(
+                host, port, allow_default=allow_default, app_context=ctx,
+            )
+        )
+
+    @mcp.tool(
+        description="Install a package via SYNO.Core.Package.Installation. "
+        "Idempotent: same-version installed -> ok=True, data.installed=False "
+        "with 'already at version X' warning. Different-version installed -> "
+        "refuses with category=upgrade_required (MVP does not implement "
+        "in-place upgrade). Primary path is install_from_server; DSM 1000-"
+        "series errors trigger the .spk fallback (download + install chain). "
+        "EULA gate: if the install response carries data.eula and "
+        "accept_eula=False, refuses with category=eula_required and "
+        "data.eula_text so the caller can present the agreement before "
+        "retrying with accept_eula=True. Returns data.method="
+        "'server'|'spk_fallback'|'noop' and the final installed version."
+    )
+    async def packages_install(
+        host: str,
+        package_id: str,
+        version: str | None = None,
+        accept_eula: bool = False,
+    ) -> dict:
+        return await _safe(
+            packages.packages_install(
+                host, package_id,
+                version=version, accept_eula=accept_eula,
+                app_context=ctx,
+            )
+        )
+
+    @mcp.tool(
+        description="Uninstall a package via SYNO.Core.Package.Uninstallation. "
+        "Safety rail: refuses with category=denylist if package_id is in "
+        "the in-process denylist of packages other agents depend on "
+        "(ContainerManager, SnapshotReplication, HyperBackup, StorageManager, "
+        "WebStation/Apache/PHP/MariaDB, SecureSignIn/LDAPServer/"
+        "DirectoryServer). Pass force=True to override — the override is "
+        "recorded as a warning. Idempotent: package not installed -> "
+        "ok=True with data.uninstalled=False, no API call fires."
+    )
+    async def packages_uninstall(
+        host: str, package_id: str, force: bool = False,
+    ) -> dict:
+        return await _safe(
+            packages.packages_uninstall(
+                host, package_id, force=force, app_context=ctx,
+            )
         )
 
     return mcp, ctx
