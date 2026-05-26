@@ -5,8 +5,8 @@
 This module ships the write half of the ``ssh_*`` tool family:
 
   * :func:`ssh_add_authorized_key`    — Phase 3a.
-  * :func:`ssh_remove_authorized_key` — Phase 3a, this commit.
-  * :func:`ssh_enable_user_ssh`       — Phase 3a, follow-up commit.
+  * :func:`ssh_remove_authorized_key` — Phase 3a.
+  * :func:`ssh_enable_user_ssh`       — Phase 3a, this commit.
 
 Read-only ``ssh_get_state`` / ``ssh_list_authorized_keys`` and
 ``ssh_set_port`` ship in a later phase.
@@ -33,11 +33,14 @@ from __future__ import annotations
 import base64
 import contextlib
 import hashlib
+import json
 import shlex
+from typing import Any
 
 from . import user_home as _user_home
-from ._helpers import get_ssh_client, success_envelope
+from ._helpers import call_dsm, get_ssh_client, success_envelope
 from .errors import DSMSshError, InvalidParam
+from .transport.http import extract_warnings
 from .transport.ssh import DSMSshClient
 
 # ---------------------------------------------------------------------------
@@ -469,4 +472,124 @@ async def ssh_remove_authorized_key(
     )
 
 
-__all__ = ["ssh_add_authorized_key", "ssh_remove_authorized_key"]
+# ---------------------------------------------------------------------------
+# Tool: ssh_enable_user_ssh
+# ---------------------------------------------------------------------------
+
+
+# DSM 7.3 SSH access gating
+# -------------------------
+#
+# There is NO per-user ``SYNO.SSH`` row in ``SYNO.Core.AppPriv.Rule`` on
+# DSM 7.3 — the ``synoappprivilege.db`` ``AppPrivRule`` table only
+# contains entries for FTP, SFTP, AFP, Rsync, WebDAV, SMB, FileStation,
+# MailServer, MailPlusServer, BackupService, and Desktop (verified
+# against CS3 / DSM 7.3 build 86009). SSH is gated by:
+#
+#   * The system-wide ``SYNO.Core.Terminal`` ``enable_ssh`` flag (set
+#     via a later phase tool — out of scope for 3a).
+#   * Membership in the ``administrators`` group on a per-user basis.
+#
+# We therefore implement ``ssh_enable_user_ssh`` as
+# ``SYNO.Core.Group.Member.add`` against the ``administrators`` group,
+# using ``admin_check`` as the idempotency probe. If a future DSM build
+# adds a dedicated per-user SSH AppPriv entry, we can swap this for the
+# rule-set call without changing the public tool signature.
+_ADMINISTRATORS_GROUP = "administrators"
+
+
+async def ssh_enable_user_ssh(
+    host: str, user: str, *, app_context,
+) -> dict:
+    """Grant SSH access to `user` on `host` by adding them to ``administrators``.
+
+    Idempotent: if ``admin_check`` says the user is already an admin,
+    returns ``ok=True`` with ``warnings=["already enabled"]`` and
+    ``data.added=False``.
+    """
+    _validate_username(user, host=host)
+
+    # Step 1: ``admin_check`` for idempotency. DSM's web framework
+    # accepts the ``name`` param as a JSON-encoded array on this
+    # endpoint (matches what the AdminCenter UI sends); a single-element
+    # array is the canonical shape for one user.
+    check_body = await call_dsm(
+        app_context, host,
+        api="SYNO.Core.Group.Member", method="admin_check", version=1,
+        params={"name": json.dumps([user])},
+    )
+    warnings: list[str] = list(extract_warnings(check_body))
+    is_admin = _extract_is_admin(check_body, user)
+
+    if is_admin:
+        warnings.insert(0, "already enabled")
+        return success_envelope(
+            host,
+            {
+                "added": False,
+                "user": user,
+                "group": _ADMINISTRATORS_GROUP,
+                "mechanism": "administrators_group_membership",
+            },
+            warnings,
+        )
+
+    # Step 2: add to administrators. DSM accepts both ``add`` and
+    # ``change`` here; we use ``add`` because it's the narrower verb
+    # (no removes possible). ``name`` is a JSON array of users to add.
+    add_body = await call_dsm(
+        app_context, host,
+        api="SYNO.Core.Group.Member", method="add", version=1,
+        params={
+            "group": _ADMINISTRATORS_GROUP,
+            "name": json.dumps([user]),
+        },
+    )
+    warnings.extend(extract_warnings(add_body))
+
+    return success_envelope(
+        host,
+        {
+            "added": True,
+            "user": user,
+            "group": _ADMINISTRATORS_GROUP,
+            "mechanism": "administrators_group_membership",
+        },
+        warnings,
+    )
+
+
+def _extract_is_admin(body: dict[str, Any], user: str) -> bool:
+    """Pull ``users[0].is_admin`` out of an ``admin_check`` response.
+
+    DSM has shipped at least two response shapes for this endpoint
+    across the 7.x line:
+
+      * ``data.users[].is_admin`` (with an optional ``name`` field per
+        entry; the UI relies on this form).
+      * ``data.is_admin`` (flat).
+
+    We accept either and return ``False`` for any unexpected shape so
+    a misparsed response falls through to the ``add`` call (which will
+    no-op on DSM's side if the user is already in the group).
+    """
+    data = body.get("data") or {}
+    users = data.get("users")
+    if isinstance(users, list):
+        for entry in users:
+            if not isinstance(entry, dict):
+                continue
+            entry_name = entry.get("name")
+            if entry_name is None or entry_name == user:
+                return bool(entry.get("is_admin"))
+    flat = data.get("is_admin")
+    if isinstance(flat, bool):
+        return flat
+    return False
+
+
+__all__ = [
+    "ssh_add_authorized_key",
+    "ssh_enable_user_ssh",
+    "ssh_remove_authorized_key",
+]
