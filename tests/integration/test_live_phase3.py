@@ -488,41 +488,38 @@ async def test_live_ssh_set_port_idempotent_same_port(
 # Test 2 — Dummy-user lifecycle + per-user SSH writes
 # ---------------------------------------------------------------------------
 #
-# CS4 SURPRISE found during live run:
+# CS4 SURPRISE found during live run (now resolved):
 #   * ``ssh_add_authorized_key``'s ``_ensure_ssh_dir`` step runs as the
 #     authenticated SSH user (Aless) and tries to ``mkdir -p
 #     /var/services/homes/<target_user>/.ssh``. DSM gives each user's
 #     home a 0700 mode owned by ``<target_user>:users`` — Aless (in
 #     administrators) cannot write into another user's home without
-#     sudo. The implementation calls plain ``mkdir`` (no sudo), so the
-#     per-user write path against a NON-self target fails with a hard
-#     ``DSMSshError: failed to ensure ... authorized_keys exist with
-#     correct perms``.
+#     sudo.
 #
-# Two viable fixes (out of scope for this commit):
-#   (a) wrap the ``mkdir/chmod/touch`` chain in ``sudo -n`` so it works
-#       on hosts where Aless has NOPASSWD sudo (CS3 does, CS4 does not).
-#   (b) execute the dir-prep as the TARGET user via ``sudo -n -u
-#       <target_user>`` — works on any sudo-enabled host without the
-#       password-on-stdin hack.
+# Phase 3 gap-fix 2026-05-26: the three SSH write tools now refuse
+# cross-user requests early with ``category=cross_user_not_supported``.
+# That means the dummy-user round-trip (writing to a NON-Aless target)
+# is structurally infeasible without a sudo-password mechanism that
+# the MCP does not (yet) ship.
 #
-# Until that fix lands, the live per-user-ssh-write flow against a
-# fresh dummy user on CS4 is not exercisable. The unit suite already
-# covers ssh_add_authorized_key, ssh_remove_authorized_key,
-# ssh_enable_user_ssh, and the User-Home pre-flight refusal.
+# The replacement live coverage exercises the calling-user (Aless)
+# round-trip — see :func:`test_live_aless_authorized_key_roundtrip`
+# below. That test is the canonical happy path the gap-fix unblocked
+# and proves the file-write transport (base64-over-exec, NO SFTP) is
+# functioning end-to-end. The dummy-user variant remains skipped with
+# the new reason.
 
 
 @pytest.mark.skip(
     reason=(
-        "ssh_add_authorized_key's _ensure_ssh_dir uses plain `mkdir` (no "
-        "sudo). On CS4 the Aless SSH user has no NOPASSWD sudo, so it "
-        "cannot create /var/services/homes/<target_user>/.ssh for a "
-        "freshly-created dummy user (DSM gives that path 0700 owned by "
-        "the target user). Live dummy-user write tests blocked until "
-        "either (a) _ensure_ssh_dir is wrapped in `sudo -n -u <user>` "
-        "or (b) CS4 grants Aless NOPASSWD sudo. Unit suite already "
-        "covers ssh_add_authorized_key / ssh_remove_authorized_key / "
-        "ssh_enable_user_ssh with mocked SSH."
+        "Cross-user SSH writes (target != calling user) refuse with "
+        "category=cross_user_not_supported as of gap-fix 2026-05-26. The "
+        "dummy-user round-trip would need NOPASSWD sudo for the calling "
+        "account (CS4 does not have it), and the strict-first rule keeps "
+        "us from shipping a password-on-stdin sudo path in this gap-fix "
+        "pass. The unit suite covers cross-user refusal "
+        "(test_*_refuses_cross_user); the live calling-user round-trip "
+        "is covered by test_live_aless_authorized_key_roundtrip."
     ),
 )
 @pytest.mark.asyncio
@@ -749,34 +746,160 @@ async def _verify_dummy_user_key_login(
 
 
 # ---------------------------------------------------------------------------
+# Test 2b — Calling-user (Aless) SSH-key round-trip
+# ---------------------------------------------------------------------------
+#
+# Phase 3 gap-fix 2026-05-26: the three SSH write tools refuse
+# cross-user calls with ``category=cross_user_not_supported``. The
+# supported flow is "write to the calling user's authorized_keys."
+# This test exercises that flow against the live CS4 Aless account:
+#
+#   1. Capture the pre-test Aless fingerprint set (must be the
+#      baseline-snapshot 4 keys; we assert that the test isn't running
+#      out of order).
+#   2. Generate an ephemeral ed25519 keypair in-memory.
+#   3. ssh_add_authorized_key(host, "Aless", pubkey, comment="
+#      mcp_integration_test_<rand>") -> assert added=True, fingerprint
+#      matches what we generated.
+#   4. Re-add the same key -> assert added=False, "key already
+#      present" warning.
+#   5. Read authorized_keys live; assert the ephemeral fingerprint is
+#      present alongside the 4 baseline fingerprints.
+#   6. ssh_remove_authorized_key(host, "Aless", fp) -> assert
+#      removed_count=1.
+#   7. ssh_remove_authorized_key(host, "Aless", fp) again ->
+#      assert removed_count=0 (idempotent).
+#   8. Re-read authorized_keys; assert Aless's fingerprint set is now
+#      identical to the baseline (no orphan key, no mutation of the
+#      original 4).
+#
+# The try/finally guarantees the ephemeral key is purged even if the
+# happy-path assertions fail, so the baseline drift check at module
+# teardown still sees a pristine state.
+
+
+@pytest.mark.asyncio
+async def test_live_aless_authorized_key_roundtrip(
+    live_app_ctx: AppContext, baseline: dict[str, object],
+) -> None:
+    """add + dedupe + remove + idempotent-remove against Aless's authorized_keys."""
+    host = next(iter(live_app_ctx.config.hosts))
+    assert baseline["aless_keys_fingerprints"], "baseline missing Aless keys"
+
+    pubkey_line, _privkey_pem = _gen_ed25519_keypair_pem()
+    pub_parts = pubkey_line.split(None, 2)
+    pub_blob = base64.b64decode(pub_parts[1], validate=True)
+    expected_fp = _fingerprint_sha256(pub_blob)
+    assert expected_fp not in baseline["aless_keys_fingerprints"], (
+        "ephemeral fingerprint collides with an existing Aless key "
+        f"(astronomically unlikely): {expected_fp}"
+    )
+    comment = f"mcp_integration_test_{secrets.token_hex(4)}"
+    # Rebuild the pubkey line with the recognizable comment so the
+    # audit trail makes it obvious where the key came from.
+    pubkey_line_with_comment = f"{pub_parts[0]} {pub_parts[1]} {comment}"
+
+    key_added = False
+    try:
+        # ----- 2b.1) ssh_add_authorized_key happy path --------------------
+        add_a = await ssh.ssh_add_authorized_key(
+            host, "Aless", pubkey_line_with_comment,
+            comment=comment,
+            app_context=live_app_ctx,
+        )
+        assert add_a["ok"] is True, add_a
+        assert add_a["data"]["added"] is True
+        assert add_a["data"]["fingerprint"] == expected_fp
+        assert add_a["data"]["user"] == "Aless"
+        key_added = True
+
+        # ----- 2b.2) ssh_add_authorized_key dedupe re-call ----------------
+        add_b = await ssh.ssh_add_authorized_key(
+            host, "Aless", pubkey_line_with_comment,
+            comment=comment,
+            app_context=live_app_ctx,
+        )
+        assert add_b["ok"] is True
+        assert add_b["data"]["added"] is False
+        assert any("key already present" in w for w in add_b["warnings"]), (
+            f"missing dedupe warning: {add_b['warnings']}"
+        )
+
+        # ----- 2b.3) live read: ephemeral fp + baseline keys all present -
+        mid_fps = await _read_aless_key_fingerprints(live_app_ctx, host)
+        assert expected_fp in mid_fps, (
+            f"ephemeral key not in authorized_keys after add: "
+            f"got {mid_fps!r}, expected {expected_fp!r}"
+        )
+        # All 4 baseline keys must still be there — we MUST NOT have
+        # accidentally rewritten the file in a way that drops them.
+        missing = baseline["aless_keys_fingerprints"] - mid_fps
+        assert not missing, f"baseline keys disappeared mid-test: {missing}"
+
+    finally:
+        # ----- 2b.4-7) ssh_remove_authorized_key happy path + idempotent -
+        remove_a = await ssh.ssh_remove_authorized_key(
+            host, "Aless", expected_fp, app_context=live_app_ctx,
+        )
+        assert remove_a["ok"] is True, remove_a
+        if key_added:
+            assert remove_a["data"]["removed_count"] == 1
+
+        remove_b = await ssh.ssh_remove_authorized_key(
+            host, "Aless", expected_fp, app_context=live_app_ctx,
+        )
+        assert remove_b["ok"] is True
+        assert remove_b["data"]["removed_count"] == 0
+
+        # ----- 2b.8) post-flight: fingerprint set matches baseline -------
+        after_fps = await _read_aless_key_fingerprints(live_app_ctx, host)
+        assert after_fps == baseline["aless_keys_fingerprints"], (
+            f"Aless fingerprint set drift after remove: "
+            f"baseline={baseline['aless_keys_fingerprints']!r}, "
+            f"after={after_fps!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Test 3 — user_home_disable REFUSAL path
 # ---------------------------------------------------------------------------
+#
+# Phase 3 gap-fix 2026-05-26: ``user_home_disable`` now refuses cleanly
+# when ``sudo -n`` cannot enumerate authorized_keys (category=
+# sudo_required) AND when it can enumerate and finds users with keys
+# (category=would_orphan_keys). EITHER refusal is acceptable for the
+# live test — the assertion is "tool refused AND User Home is still
+# enabled afterward." On CS4 with the Aless account (no NOPASSWD
+# sudo), we expect category=sudo_required.
 
 
-@pytest.mark.skip(
-    reason=(
-        "user_home_disable's would_orphan_keys safety rail relies on "
-        "`sudo -n find /var/services/homes/*/.ssh/authorized_keys -size +0c`. "
-        "On CS4 the Aless account does NOT have NOPASSWD sudo, so the "
-        "probe returns an empty affected_users list — the tool would then "
-        "PROCEED with the disable, destroying User Home and orphaning "
-        "every SSH key (including Aless's own four). The refusal path is "
-        "fully covered by the unit suite with a mocked sudo probe; running "
-        "it live against CS4 without NOPASSWD sudo is unsafe and skipped."
-    ),
-)
 @pytest.mark.asyncio
 async def test_live_user_home_disable_refusal(
     live_app_ctx: AppContext, baseline: dict[str, object],
 ) -> None:
-    """Would refuse with category=would_orphan_keys; SKIPPED on CS4 (see reason)."""
+    """confirm_destroy_keys=False -> refuse with sudo_required OR would_orphan_keys.
+
+    Either refusal category is acceptable — the test asserts the tool
+    refuses, doesn't proceed, and User Home is still enabled
+    afterward.
+    """
     host = next(iter(live_app_ctx.config.hosts))
+
     result = await user_home.user_home_disable(
         host, confirm_destroy_keys=False, app_context=live_app_ctx,
     )
-    assert result["ok"] is False
-    assert result["data"]["category"] == "would_orphan_keys"
-    assert "Aless" in result["data"]["affected_users"]
+    assert result["ok"] is False, result
+    assert result["data"]["category"] in {"sudo_required", "would_orphan_keys"}, (
+        f"unexpected refusal category: {result['data']['category']}"
+    )
+    if result["data"]["category"] == "would_orphan_keys":
+        assert "Aless" in result["data"]["affected_users"]
+    # User Home must still be enabled — the safety rail prevented the
+    # destructive disable.
+    after = await user_home.user_home_is_enabled(host, app_context=live_app_ctx)
+    assert after["data"]["enabled"] is True, (
+        f"User Home was disabled despite refusal: {after}"
+    )
 
 
 @pytest.mark.skip(
