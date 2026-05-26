@@ -674,3 +674,209 @@ async def test_user_home_disable_idempotent_when_already_disabled(
     assert route.call_count == 1
     # No ``find`` command was issued — the short-circuit ran before it.
     assert not any("find /var/services/homes" in c for c in fake_ssh.commands)
+
+
+# ---------------------------------------------------------------------------
+# user_home_disable — sudo-failure refusal (Phase 3 gap-fix 2026-05-26)
+# ---------------------------------------------------------------------------
+#
+# Original bug: ``_list_users_with_authorized_keys`` used
+# ``sudo -n find ... 2>/dev/null || true`` which silently swallowed
+# the "password required" failure on hosts without NOPASSWD sudo. The
+# tool then treated the resulting empty stdout as "no users have keys"
+# and proceeded with the destructive disable, orphaning every user's
+# SSH keys. The fix detects the sudo failure (non-zero exit + stderr
+# marker) and refuses with category=sudo_required UNLESS the caller
+# explicitly passes confirm_destroy_keys=True to bypass the safety rail.
+
+
+@pytest.mark.asyncio
+async def test_user_home_disable_refuses_when_sudo_password_required(
+    app_ctx, fixture_json,
+) -> None:
+    """sudo -n -> 'password is required' on stderr -> category=sudo_required."""
+    _seed_session(app_ctx)
+    pre_payload = fixture_json("user_home", "get_enabled.json")
+
+    routes = {
+        **_enabled_routes_with_volume(),
+        "find /var/services/homes": _ok(
+            stdout="",
+            stderr="sudo: a password is required",
+            exit_status=1,
+        ),
+    }
+    fake_ssh = _fake_ssh(routes)
+    app_ctx.cache.get("testhost").ssh_client = fake_ssh
+
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        route = mock.get("/webapi/entry.cgi").respond(200, json=pre_payload)
+        result = await user_home.user_home_disable(
+            "testhost", confirm_destroy_keys=False, app_context=app_ctx,
+        )
+
+    assert result["ok"] is False
+    assert result["data"]["category"] == "sudo_required"
+    assert "NOPASSWD sudo" in result["data"]["next_step"]
+    assert "confirm_destroy_keys" in result["data"]["next_step"]
+    # The User.Home.set call must NOT have fired — only the tri-check
+    # pre-flight ran.
+    assert route.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_user_home_disable_refuses_when_sudo_terminal_required(
+    app_ctx, fixture_json,
+) -> None:
+    """sudo -n -> 'a terminal is required' -> category=sudo_required.
+
+    DSM 7.x sudo emits 'a terminal is required' on some builds instead
+    of 'password is required' — both must be detected.
+    """
+    _seed_session(app_ctx)
+    pre_payload = fixture_json("user_home", "get_enabled.json")
+
+    routes = {
+        **_enabled_routes_with_volume(),
+        "find /var/services/homes": _ok(
+            stdout="",
+            stderr="sudo: a terminal is required to read the password",
+            exit_status=1,
+        ),
+    }
+    fake_ssh = _fake_ssh(routes)
+    app_ctx.cache.get("testhost").ssh_client = fake_ssh
+
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        mock.get("/webapi/entry.cgi").respond(200, json=pre_payload)
+        result = await user_home.user_home_disable(
+            "testhost", confirm_destroy_keys=False, app_context=app_ctx,
+        )
+
+    assert result["ok"] is False
+    assert result["data"]["category"] == "sudo_required"
+
+
+@pytest.mark.asyncio
+async def test_user_home_disable_proceeds_when_sudo_success_no_keys(
+    app_ctx, fixture_json,
+) -> None:
+    """sudo -n exits 0 with empty stdout -> legitimate 'no users have keys' path.
+
+    This was the original-bug ambiguity: the old code treated this
+    case AND a sudo-failure swallowed by `2>/dev/null || true`
+    identically. The new code distinguishes them via exit code +
+    stderr — exit 0 means the probe really did look and found
+    nothing.
+    """
+    _seed_session(app_ctx)
+    pre_payload = fixture_json("user_home", "get_enabled.json")
+    set_ok = {"success": True, "data": {}}
+
+    routes = {
+        **_enabled_routes_with_volume(),
+        # find ran successfully (exit 0) and found nothing.
+        "find /var/services/homes": _ok(
+            stdout="", stderr="", exit_status=0,
+        ),
+    }
+    fake_ssh = _fake_ssh(routes)
+    app_ctx.cache.get("testhost").ssh_client = fake_ssh
+
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        mock.get("/webapi/entry.cgi").mock(
+            side_effect=[
+                httpx.Response(200, json=pre_payload),
+                httpx.Response(200, json=set_ok),
+            ]
+        )
+        result = await user_home.user_home_disable(
+            "testhost", confirm_destroy_keys=False, app_context=app_ctx,
+        )
+
+    assert result["ok"] is True
+    assert result["data"]["disabled"] is True
+    assert result["data"]["affected_users"] == []
+
+
+@pytest.mark.asyncio
+async def test_user_home_disable_finds_keys_when_sudo_succeeds(
+    app_ctx, fixture_json,
+) -> None:
+    """sudo -n exits 0 with stdout rows -> category=would_orphan_keys.
+
+    This is the canonical "Aless has keys" CS4 case: the probe runs
+    fine (NOPASSWD or password-cached), finds Aless's authorized_keys,
+    and the tool refuses with affected_users=['Aless'].
+    """
+    _seed_session(app_ctx)
+    pre_payload = fixture_json("user_home", "get_enabled.json")
+    find_output = "/var/services/homes/Aless/.ssh/authorized_keys\n"
+
+    routes = {
+        **_enabled_routes_with_volume(),
+        "find /var/services/homes": _ok(
+            stdout=find_output, stderr="", exit_status=0,
+        ),
+    }
+    fake_ssh = _fake_ssh(routes)
+    app_ctx.cache.get("testhost").ssh_client = fake_ssh
+
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        route = mock.get("/webapi/entry.cgi").respond(200, json=pre_payload)
+        result = await user_home.user_home_disable(
+            "testhost", confirm_destroy_keys=False, app_context=app_ctx,
+        )
+
+    assert result["ok"] is False
+    assert result["data"]["category"] == "would_orphan_keys"
+    assert result["data"]["affected_users"] == ["Aless"]
+    # No web set call fired.
+    assert route.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_user_home_disable_confirm_overrides_sudo_failure(
+    app_ctx, fixture_json,
+) -> None:
+    """sudo -n fails BUT confirm_destroy_keys=True -> tool still proceeds.
+
+    The explicit override is the caller saying "I know what I'm doing,
+    just flip the switch." The tool surfaces a warning so the audit
+    trail records that the would_orphan_keys check was skipped, but
+    does not refuse.
+    """
+    _seed_session(app_ctx)
+    pre_payload = fixture_json("user_home", "get_enabled.json")
+    set_ok = {"success": True, "data": {}}
+
+    routes = {
+        **_enabled_routes_with_volume(),
+        "find /var/services/homes": _ok(
+            stdout="",
+            stderr="sudo: a password is required",
+            exit_status=1,
+        ),
+    }
+    fake_ssh = _fake_ssh(routes)
+    app_ctx.cache.get("testhost").ssh_client = fake_ssh
+
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        mock.get("/webapi/entry.cgi").mock(
+            side_effect=[
+                httpx.Response(200, json=pre_payload),
+                httpx.Response(200, json=set_ok),
+            ]
+        )
+        result = await user_home.user_home_disable(
+            "testhost", confirm_destroy_keys=True, app_context=app_ctx,
+        )
+
+    assert result["ok"] is True
+    assert result["data"]["disabled"] is True
+    # We never enumerated, so affected_users stays empty.
+    assert result["data"]["affected_users"] == []
+    # Warning records the sudo-bypass.
+    assert any(
+        "sudo -n unavailable" in w for w in result["warnings"]
+    ), f"missing sudo-bypass warning: {result['warnings']}"
