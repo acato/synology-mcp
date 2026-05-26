@@ -123,7 +123,13 @@ async def _read_sysfs_for_iface(ssh: DSMSshClient, name: str) -> dict[str, Any]:
 
 
 def _merge_iface(web: dict[str, Any], sysfs: dict[str, Any]) -> dict[str, Any]:
-    """Combine web-API + sysfs data into the canonical schema."""
+    """Combine web-API + sysfs data into the canonical schema.
+
+    The returned dict carries two underscore-prefixed implementation-detail
+    fields (``_web_speed_mbps`` / ``_sysfs_speed_mbps``) used for the
+    sysfs-vs-web speed cross-check. Public envelope builders MUST strip
+    these before returning via :func:`_strip_internal_fields`.
+    """
     speed_sys = _int_or_none(sysfs.get("speed"))
     speed_web = web.get("speed_mbps_web")
     # Prefer sysfs if it's a sane positive number; -1 from sysfs means link down.
@@ -153,6 +159,31 @@ def _merge_iface(web: dict[str, Any], sysfs: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _speed_mismatch_warning(name: str, iface: dict[str, Any]) -> str | None:
+    """Return a warning string when sysfs and web disagree on link speed.
+
+    Returns ``None`` if both numbers agree, either is missing, or sysfs reports
+    a non-positive value (link down). Canonical source is sysfs.
+    """
+    web = iface.get("_web_speed_mbps")
+    sys = iface.get("_sysfs_speed_mbps")
+    if web is None or sys is None:
+        return None
+    if sys <= 0:
+        return None
+    if web == sys:
+        return None
+    return (
+        f"speed mismatch on {name}: web={web}Mb/s, sysfs={sys}Mb/s "
+        "(sysfs is canonical)"
+    )
+
+
+def _strip_internal_fields(iface: dict[str, Any]) -> dict[str, Any]:
+    """Drop underscore-prefixed implementation-detail fields from a NIC dict."""
+    return {k: v for k, v in iface.items() if not k.startswith("_")}
+
+
 async def network_list_interfaces(host: str, *, app_context) -> dict:
     """List interfaces with name/mac/mtu/state/speed/IPs (web + sysfs merged)."""
     body = await call_dsm(
@@ -164,12 +195,17 @@ async def network_list_interfaces(host: str, *, app_context) -> dict:
     # Cross-check via sysfs over SSH.
     ssh = get_ssh_client(app_context, host)
     merged: list[dict[str, Any]] = []
+    warnings: list[str] = list(extract_warnings(body))
     for iface in web_ifaces:
         if not iface["name"]:
             continue
         sysfs = await _read_sysfs_for_iface(ssh, iface["name"])
-        merged.append(_merge_iface(iface, sysfs))
-    return success_envelope(host, {"interfaces": merged}, extract_warnings(body))
+        full = _merge_iface(iface, sysfs)
+        warn = _speed_mismatch_warning(full["name"], full)
+        if warn:
+            warnings.append(warn)
+        merged.append(_strip_internal_fields(full))
+    return success_envelope(host, {"interfaces": merged}, warnings)
 
 
 # ----- per-interface detail (ethtool) --------------------------------------
@@ -204,33 +240,41 @@ def _first_match(pattern: re.Pattern[str], text: str) -> str | None:
 
 
 async def network_get_interface(host: str, name: str, *, app_context) -> dict:
-    """Full detail for one interface: web API + sysfs + ethtool driver/firmware."""
-    listing = await network_list_interfaces(host, app_context=app_context)
-    interfaces = listing["data"]["interfaces"]
-    found = next((i for i in interfaces if i["name"] == name), None)
+    """Full detail for one interface: web API + sysfs + ethtool driver/firmware.
+
+    Re-fetches via the merge path so the speed-mismatch cross-check can run on
+    the un-stripped record, then strips the underscored debug fields before
+    returning. The public envelope NEVER includes ``_web_speed_mbps`` /
+    ``_sysfs_speed_mbps``.
+    """
+    body = await call_dsm(
+        app_context, host,
+        api="SYNO.Core.Network.Interface", method="list", version=1,
+    )
+    raw_list = _extract_web_interface_list(body)
+    web_ifaces = [_normalize_iface_web(i) for i in raw_list]
+    ssh = get_ssh_client(app_context, host)
+    full_records: list[dict[str, Any]] = []
+    for iface in web_ifaces:
+        if not iface["name"]:
+            continue
+        sysfs = await _read_sysfs_for_iface(ssh, iface["name"])
+        full_records.append(_merge_iface(iface, sysfs))
+    found = next((i for i in full_records if i["name"] == name), None)
     if found is None:
         from .errors import InvalidParam
 
         raise InvalidParam(
             f"interface {name!r} not found on host {host!r}",
             host=host,
-            details={"available": [i["name"] for i in interfaces]},
+            details={"available": [i["name"] for i in full_records]},
         )
-    ssh = get_ssh_client(app_context, host)
     ethtool_info = await _ethtool_for_iface(ssh, name)
-    detail = {**found, "ethtool": ethtool_info}
-    # Surface a warning if sysfs and web disagree on speed (canonical = sysfs).
-    warnings: list[str] = list(listing.get("warnings") or [])
-    if (
-        found.get("_web_speed_mbps") is not None
-        and found.get("_sysfs_speed_mbps") is not None
-        and found["_web_speed_mbps"] != found["_sysfs_speed_mbps"]
-        and found["_sysfs_speed_mbps"] > 0
-    ):
-        warnings.append(
-            f"speed mismatch on {name}: web={found['_web_speed_mbps']}Mb/s, "
-            f"sysfs={found['_sysfs_speed_mbps']}Mb/s (sysfs is canonical)"
-        )
+    warnings: list[str] = list(extract_warnings(body))
+    warn = _speed_mismatch_warning(name, found)
+    if warn:
+        warnings.append(warn)
+    detail = {**_strip_internal_fields(found), "ethtool": ethtool_info}
     return success_envelope(host, detail, warnings)
 
 

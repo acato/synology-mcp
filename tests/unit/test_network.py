@@ -83,6 +83,14 @@ async def test_network_list_interfaces_merges_web_and_sysfs(
     assert eth2["state"] == "up"
     assert eth2["speed_mbps"] == 10000
     assert eth2["mtu"] == 9000
+    # Internal debug fields must NOT appear in the public envelope.
+    for iface in interfaces:
+        assert "_web_speed_mbps" not in iface
+        assert "_sysfs_speed_mbps" not in iface
+        for key in iface:
+            assert not key.startswith("_"), (
+                f"underscored field leaked: {key!r}"
+            )
 
 
 @pytest.mark.asyncio
@@ -149,6 +157,11 @@ async def test_network_get_interface_includes_ethtool(app_ctx, fixture_json) -> 
     assert detail["ethtool"]["driver"] == "i40e"
     assert detail["ethtool"]["firmware_version"] == "6.01 0x80003557"
     assert detail["ethtool"]["bus_info"] == "0000:03:00.0"
+    # Internal debug fields must NOT appear in the public envelope.
+    assert "_web_speed_mbps" not in detail
+    assert "_sysfs_speed_mbps" not in detail
+    for key in detail:
+        assert not key.startswith("_"), f"underscored field leaked: {key!r}"
 
 
 @pytest.mark.asyncio

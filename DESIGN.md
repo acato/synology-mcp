@@ -351,9 +351,11 @@ Remove by fingerprint. Returns `removed_count`.
 
 Each interface: name (`eth0`/`bond0`/`docker0`/...), mac, mtu, state (`up`/`down`), speed (Mb/s, null if down), duplex, ip addresses, link partner detail if available.
 
+The web-API vs sysfs link-speed cross-check happens server-side: any mismatch is surfaced as a string in the envelope's `warnings[]` (sysfs is treated as canonical). Underscore-prefixed implementation fields (e.g. `_web_speed_mbps`, `_sysfs_speed_mbps`) MUST NOT appear in the public per-interface dict.
+
 #### `network_get_interface(host, name)`
 
-Full detail for one interface including driver, firmware (if available via ethtool over SSH), and `/sys/class/net/<name>/speed` cross-checked against web API speed.
+Full detail for one interface including driver, firmware (if available via ethtool over SSH), and `/sys/class/net/<name>/speed` cross-checked against web API speed. Same internal-field stripping rule as `network_list_interfaces`.
 
 ---
 

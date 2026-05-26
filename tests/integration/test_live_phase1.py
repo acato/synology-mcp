@@ -136,6 +136,14 @@ async def test_live_network_list_interfaces(live_app_ctx: AppContext) -> None:
     # Synology always reports at least eth0.
     names = {i["name"] for i in interfaces}
     assert "eth0" in names or any(n.startswith("eth") for n in names)
+    # Public envelope must NOT leak internal debug fields.
+    for iface in interfaces:
+        assert "_web_speed_mbps" not in iface
+        assert "_sysfs_speed_mbps" not in iface
+        for key in iface:
+            assert not key.startswith("_"), (
+                f"underscored field leaked: {key!r}"
+            )
 
 
 @pytest.mark.asyncio
@@ -152,3 +160,8 @@ async def test_live_network_get_interface_eth0(live_app_ctx: AppContext) -> None
     assert detail["name"] == eth_names[0]
     # ethtool may or may not be installed; the call returns {} if not.
     assert "ethtool" in detail
+    # Public envelope must NOT leak internal debug fields.
+    assert "_web_speed_mbps" not in detail
+    assert "_sysfs_speed_mbps" not in detail
+    for key in detail:
+        assert not key.startswith("_"), f"underscored field leaked: {key!r}"
