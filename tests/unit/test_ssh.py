@@ -685,3 +685,272 @@ def test_split_and_join_authorized_keys_round_trip() -> None:
     assert entries == [line1, line2]
     joined = ssh._join_authorized_keys(entries)
     assert joined == f"{line1}\n{line2}\n"
+
+
+# ===========================================================================
+# ssh_set_port — Phase 3c
+# ===========================================================================
+
+
+def _terminal_get_v3_body(ssh_port: int = 22334, **overrides) -> dict:
+    """Return a canonical SYNO.Core.Terminal.get v3 response shape.
+
+    Mirrors what CS3 actually returns (probed 2026-05-26). Caller can
+    override any scalar field via kwargs to exercise carry-forward
+    behaviour.
+    """
+    data = {
+        "enable_ssh": True,
+        "enable_telnet": False,
+        "forbid_console": False,
+        "ssh_port": ssh_port,
+        "ssh_cipher": [
+            {"name": "aes256-ctr", "in_use": True},
+        ],
+        "ssh_kex": [
+            {"name": "curve25519-sha256", "in_use": True},
+        ],
+        "ssh_mac": [
+            {"name": "hmac-sha2-256", "in_use": True},
+        ],
+    }
+    data.update(overrides)
+    return {"success": True, "data": data}
+
+
+@pytest.mark.asyncio
+async def test_set_port_happy_path_verifies_via_fresh_handshake(
+    app_ctx, monkeypatch,
+) -> None:
+    """Valid port -> Terminal.get + Terminal.set + fresh-paramiko verify succeed."""
+    _seed_session(app_ctx)
+    # SSH probe: port not in use.
+    fake_ssh = _fake_ssh({"ss -lnt": _ok("")})
+    app_ctx.cache.get("testhost").ssh_client = fake_ssh
+
+    # Mock the verify helper — we don't actually want to open a real
+    # paramiko session in unit tests.
+    async def _fake_verify(host_cfg, port, password):
+        assert port == 23456
+        return True, None
+    monkeypatch.setattr(ssh, "_verify_ssh_on_port", _fake_verify)
+
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        mock.get("/webapi/entry.cgi").mock(
+            side_effect=[
+                httpx.Response(200, json=_terminal_get_v3_body(22334)),
+                httpx.Response(
+                    200,
+                    json={"success": True, "data": {}},
+                ),
+            ]
+        )
+        result = await ssh.ssh_set_port(
+            "testhost", 23456, app_context=app_ctx,
+        )
+
+    assert result["ok"] is True
+    assert result["data"]["changed"] is True
+    assert result["data"]["verified"] is True
+    assert result["data"]["old_port"] == 22334
+    assert result["data"]["new_port"] == 23456
+    # No "did not respond" warning when verify succeeded.
+    assert not any("did not respond" in w for w in result["warnings"])
+    # Inspect the Terminal.set call — it MUST carry the full payload
+    # forward (enable_ssh + cipher/kex/mac arrays), not just the new
+    # port, to avoid disabling other settings as a side-effect.
+    set_call = [
+        c for c in fake_ssh.commands if "ss -lnt" in c
+    ]
+    assert set_call, "ss -lnt should have been invoked"
+
+
+@pytest.mark.asyncio
+async def test_set_port_idempotent_when_already_on_port(app_ctx) -> None:
+    """Current port == requested port -> no mutation, ok=True, changed=False."""
+    _seed_session(app_ctx)
+    fake_ssh = _fake_ssh({"ss -lnt": _ok("")})
+    app_ctx.cache.get("testhost").ssh_client = fake_ssh
+
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        route = mock.get("/webapi/entry.cgi").respond(
+            200, json=_terminal_get_v3_body(22334),
+        )
+        result = await ssh.ssh_set_port(
+            "testhost", 22334, app_context=app_ctx,
+        )
+
+    assert result["ok"] is True
+    assert result["data"]["changed"] is False
+    assert result["data"]["verified"] is True
+    assert result["data"]["old_port"] == 22334
+    assert result["data"]["new_port"] == 22334
+    assert "already on this port" in result["warnings"]
+    # ONLY the Terminal.get call should have fired — no .set.
+    assert route.call_count == 1
+    # ss probe never ran either — idempotency short-circuits before it.
+    assert not any("ss -lnt" in c for c in fake_ssh.commands)
+
+
+@pytest.mark.asyncio
+async def test_set_port_refuses_when_port_already_in_use(app_ctx) -> None:
+    """ss -lnt finds a listener -> category=port_already_in_use refusal."""
+    _seed_session(app_ctx)
+    fake_ssh = _fake_ssh({
+        # A LISTEN row matches the requested port.
+        "ss -lnt": _ok(
+            "LISTEN 0  128  0.0.0.0:23456  0.0.0.0:*  users:((\"smbd\",pid=1234,fd=33))",
+        ),
+    })
+    app_ctx.cache.get("testhost").ssh_client = fake_ssh
+
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        mock.get("/webapi/entry.cgi").respond(
+            200, json=_terminal_get_v3_body(22334),
+        )
+        result = await ssh.ssh_set_port(
+            "testhost", 23456, app_context=app_ctx,
+        )
+
+    assert result["ok"] is False
+    assert result["data"]["category"] == "port_already_in_use"
+    assert result["data"]["port"] == 23456
+
+
+@pytest.mark.asyncio
+async def test_set_port_refuses_port_22_without_allow_default(app_ctx) -> None:
+    """port=22 without allow_default=True -> InvalidParam, no DSM calls."""
+    _seed_session(app_ctx)
+    fake_ssh = _fake_ssh()
+    app_ctx.cache.get("testhost").ssh_client = fake_ssh
+    with respx.mock(
+        base_url="https://192.0.2.10:5001", assert_all_called=False,
+    ) as mock:
+        route = mock.get("/webapi/entry.cgi").respond(
+            200, json={"success": True, "data": {}},
+        )
+        with pytest.raises(InvalidParam):
+            await ssh.ssh_set_port("testhost", 22, app_context=app_ctx)
+        assert route.called is False
+
+
+@pytest.mark.asyncio
+async def test_set_port_allows_port_22_with_allow_default(
+    app_ctx, monkeypatch,
+) -> None:
+    """port=22 with allow_default=True -> no InvalidParam, validation passes."""
+    _seed_session(app_ctx)
+    fake_ssh = _fake_ssh({"ss -lnt": _ok("")})
+    app_ctx.cache.get("testhost").ssh_client = fake_ssh
+
+    async def _fake_verify(host_cfg, port, password):
+        return True, None
+    monkeypatch.setattr(ssh, "_verify_ssh_on_port", _fake_verify)
+
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        mock.get("/webapi/entry.cgi").mock(
+            side_effect=[
+                httpx.Response(200, json=_terminal_get_v3_body(22334)),
+                httpx.Response(200, json={"success": True, "data": {}}),
+            ]
+        )
+        result = await ssh.ssh_set_port(
+            "testhost", 22, allow_default=True, app_context=app_ctx,
+        )
+    assert result["ok"] is True
+    assert result["data"]["new_port"] == 22
+
+
+@pytest.mark.asyncio
+async def test_set_port_rejects_out_of_range_port(app_ctx) -> None:
+    """Port outside [1024, 65535] -> InvalidParam, no DSM calls."""
+    _seed_session(app_ctx)
+    fake_ssh = _fake_ssh()
+    app_ctx.cache.get("testhost").ssh_client = fake_ssh
+    with respx.mock(
+        base_url="https://192.0.2.10:5001", assert_all_called=False,
+    ) as mock:
+        route = mock.get("/webapi/entry.cgi").respond(
+            200, json={"success": True, "data": {}},
+        )
+        for bad_port in (-1, 0, 80, 1023, 65536, 99999):
+            with pytest.raises(InvalidParam):
+                await ssh.ssh_set_port(
+                    "testhost", bad_port, app_context=app_ctx,
+                )
+        assert route.called is False
+
+
+@pytest.mark.asyncio
+async def test_set_port_verify_failure_surfaces_warning_not_revert(
+    app_ctx, monkeypatch,
+) -> None:
+    """Verify timeout -> ok=True, verified=False, warning, NO revert."""
+    _seed_session(app_ctx)
+    fake_ssh = _fake_ssh({"ss -lnt": _ok("")})
+    app_ctx.cache.get("testhost").ssh_client = fake_ssh
+
+    async def _fake_verify(host_cfg, port, password):
+        return False, "timed out after 10s"
+    monkeypatch.setattr(ssh, "_verify_ssh_on_port", _fake_verify)
+
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        route = mock.get("/webapi/entry.cgi").mock(
+            side_effect=[
+                httpx.Response(200, json=_terminal_get_v3_body(22334)),
+                httpx.Response(200, json={"success": True, "data": {}}),
+            ]
+        )
+        result = await ssh.ssh_set_port(
+            "testhost", 23456, app_context=app_ctx,
+        )
+
+    # ok=True because the mutation succeeded; verified=False because
+    # the fresh handshake timed out. No revert (the user's existing
+    # session is the escape hatch).
+    assert result["ok"] is True
+    assert result["data"]["changed"] is True
+    assert result["data"]["verified"] is False
+    assert any("did not respond" in w for w in result["warnings"])
+    # Exactly two DSM calls — get + set — and NO third "revert" call.
+    assert route.call_count == 2
+
+
+def test_terminal_set_payload_carries_forward_all_fields() -> None:
+    """_terminal_set_payload must include enable_ssh/telnet/console + arrays."""
+    current = {
+        "enable_ssh": True,
+        "enable_telnet": False,
+        "forbid_console": False,
+        "ssh_port": 22334,
+        "ssh_cipher": [{"name": "aes256-ctr", "in_use": True}],
+        "ssh_kex": [{"name": "curve25519-sha256", "in_use": True}],
+        "ssh_mac": [{"name": "hmac-sha2-256", "in_use": True}],
+    }
+    payload = ssh._terminal_set_payload(current, 23456)
+    assert payload["ssh_port"] == "23456"
+    assert payload["enable_ssh"] == "true"
+    assert payload["enable_telnet"] == "false"
+    assert payload["forbid_console"] == "false"
+    # Arrays must round-trip JSON-encoded.
+    import json as _json
+    assert _json.loads(payload["ssh_cipher"]) == current["ssh_cipher"]
+    assert _json.loads(payload["ssh_kex"]) == current["ssh_kex"]
+    assert _json.loads(payload["ssh_mac"]) == current["ssh_mac"]
+
+
+def test_validate_port_accepts_user_range() -> None:
+    """Any port in [1024, 65535] passes _validate_port."""
+    for port in (1024, 2222, 22334, 49151, 65535):
+        ssh._validate_port(port, allow_default=False)
+    # Port 22 ONLY when allow_default=True.
+    ssh._validate_port(22, allow_default=True)
+    with pytest.raises(InvalidParam):
+        ssh._validate_port(22, allow_default=False)
+
+
+def test_validate_port_rejects_non_int() -> None:
+    """Strings / floats / bools -> InvalidParam."""
+    for bad in ("22334", 22334.5, True, None):
+        with pytest.raises(InvalidParam):
+            ssh._validate_port(bad, allow_default=False)  # type: ignore[arg-type]

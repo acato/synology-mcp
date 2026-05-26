@@ -1,0 +1,19 @@
+{
+  "success": true,
+  "data": {
+    "enable_ssh": true,
+    "enable_telnet": false,
+    "forbid_console": false,
+    "ssh_port": 22334,
+    "ssh_cipher": [
+      {"hardware_support": false, "in_use": true, "name": "aes128-ctr", "security_level": 2},
+      {"hardware_support": false, "in_use": true, "name": "aes256-ctr", "security_level": 2}
+    ],
+    "ssh_kex": [
+      {"hardware_support": false, "in_use": true, "name": "curve25519-sha256", "security_level": 2}
+    ],
+    "ssh_mac": [
+      {"hardware_support": false, "in_use": true, "name": "hmac-sha2-256", "security_level": 2}
+    ]
+  }
+}

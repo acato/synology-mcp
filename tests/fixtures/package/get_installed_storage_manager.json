@@ -1,0 +1,9 @@
+{
+  "success": true,
+  "data": {
+    "id": "StorageManager",
+    "name": "Storage Manager",
+    "version": "1.0.0-0001",
+    "additional": {"install_type": "system"}
+  }
+}
