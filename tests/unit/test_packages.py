@@ -271,24 +271,76 @@ def _get_installed_body(package_id: str, version: str) -> dict:
     }
 
 
+def _server_list_body(package_id: str, version: str, **overrides) -> dict:
+    """Build a minimal SYNO.Core.Package.Server.list v2 response.
+
+    Mirrors the real catalog row shape (probed from CS3 live). The
+    canonical fields ``packages_install`` reads are ``package``,
+    ``version``, ``link``, ``md5``, ``size``, ``type``, ``source``,
+    ``beta``, ``qinst``.
+    """
+    row = {
+        "package": package_id,
+        "id": package_id,
+        "version": version,
+        "link": f"https://example.invalid/{package_id}-{version}.spk",
+        "md5": "0123456789abcdef0123456789abcdef",
+        "size": 12345,
+        "type": 0,
+        "source": "syno",
+        "beta": False,
+        "qinst": True,
+    }
+    row.update(overrides)
+    return {
+        "success": True,
+        "data": {
+            "packages": [row],
+            "beta_packages": [],
+            "categories": [],
+            "banners": [],
+        },
+    }
+
+
+def _server_list_empty_body() -> dict:
+    """Server.list response containing no matching package."""
+    return {
+        "success": True,
+        "data": {
+            "packages": [
+                {
+                    "package": "SomethingElse", "id": "SomethingElse",
+                    "version": "1.0.0", "source": "syno",
+                },
+            ],
+            "beta_packages": [],
+            "categories": [],
+            "banners": [],
+        },
+    }
+
+
 @pytest.mark.asyncio
-async def test_install_happy_path_install_from_server(app_ctx) -> None:
-    """Unknown package + install_from_server success -> installed=True, method=server."""
+async def test_install_happy_path_online_via_install_verb(app_ctx) -> None:
+    """Unknown package -> Server.list -> Installation.install -> installed=True, method=online."""
     _seed_session(app_ctx)
-    # Sequence of responses:
+    # Sequence:
     #   1. Package.get -> 102 (not installed)
-    #   2. install_from_server -> {task_id: ...}
-    #   3. Installation.status -> finished=True
-    #   4. Package.get -> installed at version 1.2.3
+    #   2. Server.list -> catalog row for "Test" v1.2.3
+    #   3. Installation.install -> {task_id: ...}
+    #   4. Installation.status -> finished=True
+    #   5. Package.get -> installed at 1.2.3
     with respx.mock(base_url="https://192.0.2.10:5001") as mock:
-        mock.get("/webapi/entry.cgi").mock(
+        route = mock.get("/webapi/entry.cgi").mock(
             side_effect=[
                 httpx.Response(200, json=_get_not_installed_body()),
+                httpx.Response(200, json=_server_list_body("Test", "1.2.3")),
                 httpx.Response(
                     200,
                     json={
                         "success": True,
-                        "data": {"task_id": "install_task_001"},
+                        "data": {"task_id": "@SYNOPKG_DOWNLOAD_Test"},
                     },
                 ),
                 httpx.Response(
@@ -307,9 +359,21 @@ async def test_install_happy_path_install_from_server(app_ctx) -> None:
 
     assert result["ok"] is True
     assert result["data"]["installed"] is True
-    assert result["data"]["method"] == "server"
+    assert result["data"]["method"] == "online"
     assert result["data"]["version"] == "1.2.3"
     assert result["data"]["package_id"] == "Test"
+    # The 3rd web call MUST be Installation.install with the canonical
+    # DSM 7.3 payload (NOT install_from_server).
+    install_qs = dict(route.calls[2].request.url.params)
+    assert install_qs["api"] == "SYNO.Core.Package.Installation"
+    assert install_qs["method"] == "install"
+    assert install_qs["name"] == "Test"
+    # Catalog fields must round-trip into the install payload.
+    assert install_qs["url"].endswith("Test-1.2.3.spk")
+    assert install_qs["checksum"] == "0123456789abcdef0123456789abcdef"
+    assert install_qs["filesize"] == "12345"
+    assert install_qs["is_syno"] == "true"
+    assert install_qs["operation"] == "install"
 
 
 @pytest.mark.asyncio
@@ -327,15 +391,19 @@ async def test_install_treats_dsm_4545_as_not_installed(app_ctx) -> None:
             side_effect=[
                 # 1. Package.get -> 4545 (DSM Package Center "not installed").
                 httpx.Response(200, json=_get_not_installed_4545_body()),
-                # 2. install_from_server -> task_id.
+                # 2. Server.list -> catalog row.
+                httpx.Response(
+                    200, json=_server_list_body("LogCenter", "9.9.9"),
+                ),
+                # 3. Installation.install -> task_id.
                 httpx.Response(
                     200,
                     json={
                         "success": True,
-                        "data": {"task_id": "task_4545"},
+                        "data": {"task_id": "@SYNOPKG_DOWNLOAD_LogCenter"},
                     },
                 ),
-                # 3. status -> finished.
+                # 4. status -> finished.
                 httpx.Response(
                     200,
                     json={
@@ -343,7 +411,7 @@ async def test_install_treats_dsm_4545_as_not_installed(app_ctx) -> None:
                         "data": {"finished": True, "status": "done"},
                     },
                 ),
-                # 4. Package.get -> installed at v9.9.9.
+                # 5. Package.get -> installed at v9.9.9.
                 httpx.Response(
                     200, json=_get_installed_body("LogCenter", "9.9.9"),
                 ),
@@ -355,61 +423,49 @@ async def test_install_treats_dsm_4545_as_not_installed(app_ctx) -> None:
 
     assert result["ok"] is True
     assert result["data"]["installed"] is True
-    assert result["data"]["method"] == "server"
+    assert result["data"]["method"] == "online"
     assert result["data"]["version"] == "9.9.9"
 
 
 @pytest.mark.asyncio
-async def test_install_spk_fallback_after_1000_series_error(app_ctx) -> None:
-    """install_from_server returns DSM 1004 -> download + install fallback."""
+async def test_install_refuses_when_not_in_catalog(app_ctx) -> None:
+    """Package not in Server.list -> category=not_in_catalog, no install."""
+    _seed_session(app_ctx)
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        route = mock.get("/webapi/entry.cgi").mock(
+            side_effect=[
+                httpx.Response(200, json=_get_not_installed_body()),
+                httpx.Response(200, json=_server_list_empty_body()),
+            ]
+        )
+        result = await packages.packages_install(
+            "testhost", "Bogus", app_context=app_ctx,
+        )
+
+    assert result["ok"] is False
+    assert result["data"]["category"] == "not_in_catalog"
+    assert result["data"]["package_id"] == "Bogus"
+    # Exactly two calls — Package.get + Server.list. No install.
+    assert route.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_install_refuses_on_dsm_1000_series_with_warning(app_ctx) -> None:
+    """Installation.install returning DSM 1004 -> category=online_install_failed.
+
+    The historical spk_fallback behaviour is documented but not yet
+    implemented in this gap-fix pass; we surface a clear refusal envelope
+    so the caller knows the online path failed (and why).
+    """
     _seed_session(app_ctx)
     with respx.mock(base_url="https://192.0.2.10:5001") as mock:
         mock.get("/webapi/entry.cgi").mock(
             side_effect=[
-                # 1. Package.get -> not installed.
                 httpx.Response(200, json=_get_not_installed_body()),
-                # 2. install_from_server -> DSM 1004.
+                httpx.Response(200, json=_server_list_body("Test", "1.2.3")),
+                # Install fails with DSM 1004 (network error).
                 httpx.Response(
                     200, json={"success": False, "error": {"code": 1004}},
-                ),
-                # 3. download -> task_id + path.
-                httpx.Response(
-                    200,
-                    json={
-                        "success": True,
-                        "data": {
-                            "task_id": "dl_002",
-                            "path": "/tmp/Test-1.2.3.spk",
-                        },
-                    },
-                ),
-                # 4. status (download poll) -> finished.
-                httpx.Response(
-                    200,
-                    json={
-                        "success": True,
-                        "data": {
-                            "finished": True, "status": "done",
-                            "path": "/tmp/Test-1.2.3.spk",
-                        },
-                    },
-                ),
-                # 5. install (local .spk) -> task_id.
-                httpx.Response(
-                    200,
-                    json={"success": True, "data": {"task_id": "inst_003"}},
-                ),
-                # 6. status (install poll) -> finished.
-                httpx.Response(
-                    200,
-                    json={
-                        "success": True,
-                        "data": {"finished": True, "status": "done"},
-                    },
-                ),
-                # 7. Package.get -> installed at the new version.
-                httpx.Response(
-                    200, json=_get_installed_body("Test", "1.2.3"),
                 ),
             ]
         )
@@ -417,23 +473,23 @@ async def test_install_spk_fallback_after_1000_series_error(app_ctx) -> None:
             "testhost", "Test", version="1.2.3", app_context=app_ctx,
         )
 
-    assert result["ok"] is True
-    assert result["data"]["installed"] is True
-    assert result["data"]["method"] == "spk_fallback"
-    assert result["data"]["version"] == "1.2.3"
-    # The fallback-reason note is preserved as a warning.
-    assert any("install_from_server failed" in w for w in result["warnings"])
+    assert result["ok"] is False
+    assert result["data"]["category"] == "online_install_failed"
+    assert result["data"]["dsm_error_code"] == 1004
+    # Warning explains the spk_fallback gap.
+    assert any("spk_fallback" in w for w in result["warnings"])
 
 
 @pytest.mark.asyncio
 async def test_install_eula_required_aborts_without_accept(app_ctx) -> None:
-    """install_from_server returns data.eula -> category=eula_required, no install."""
+    """install response carries data.eula -> category=eula_required, no further calls."""
     _seed_session(app_ctx)
     eula_text = "Synology Package License Agreement: ..."
     with respx.mock(base_url="https://192.0.2.10:5001") as mock:
         mock.get("/webapi/entry.cgi").mock(
             side_effect=[
                 httpx.Response(200, json=_get_not_installed_body()),
+                httpx.Response(200, json=_server_list_body("Test", "1.2.3")),
                 httpx.Response(
                     200,
                     json={"success": True, "data": {"eula": eula_text}},
@@ -452,12 +508,13 @@ async def test_install_eula_required_aborts_without_accept(app_ctx) -> None:
 
 @pytest.mark.asyncio
 async def test_install_eula_accepted_proceeds(app_ctx) -> None:
-    """install_from_server with accept_eula=True succeeds without aborting."""
+    """accept_eula=True passes through to the install call without aborting."""
     _seed_session(app_ctx)
     with respx.mock(base_url="https://192.0.2.10:5001") as mock:
         route = mock.get("/webapi/entry.cgi").mock(
             side_effect=[
                 httpx.Response(200, json=_get_not_installed_body()),
+                httpx.Response(200, json=_server_list_body("Test", "2.0.0")),
                 # No EULA challenge this time — install proceeds directly.
                 httpx.Response(
                     200,
@@ -483,10 +540,32 @@ async def test_install_eula_accepted_proceeds(app_ctx) -> None:
         )
     assert result["ok"] is True
     assert result["data"]["installed"] is True
-    # accept_eula=true was passed through in the install_from_server call.
-    install_call_url = route.calls[1].request.url
-    qs = dict(install_call_url.params)
-    assert qs["accept_eula"] == "true"
+    # accept_eula=true was passed through in the Installation.install call.
+    install_qs = dict(route.calls[2].request.url.params)
+    assert install_qs["accept_eula"] == "true"
+    assert install_qs["method"] == "install"
+
+
+@pytest.mark.asyncio
+async def test_install_refuses_when_catalog_version_differs(app_ctx) -> None:
+    """Caller-pinned version vs. catalog's only-version -> category=version_mismatch."""
+    _seed_session(app_ctx)
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        route = mock.get("/webapi/entry.cgi").mock(
+            side_effect=[
+                httpx.Response(200, json=_get_not_installed_body()),
+                # Catalog only carries v2.0.0, but caller asked for v1.0.0.
+                httpx.Response(200, json=_server_list_body("Test", "2.0.0")),
+            ]
+        )
+        result = await packages.packages_install(
+            "testhost", "Test", version="1.0.0", app_context=app_ctx,
+        )
+    assert result["ok"] is False
+    assert result["data"]["category"] == "version_mismatch"
+    assert result["data"]["requested_version"] == "1.0.0"
+    assert result["data"]["catalog_version"] == "2.0.0"
+    assert route.call_count == 2
 
 
 @pytest.mark.asyncio

@@ -30,12 +30,24 @@ Key DSM 7.3 quirks handled here:
   the package is stopped — we accept any exit status and parse the JSON.
 * ``synopkg is_onoff`` is the canonical on/off check (exit 0 = on,
   non-zero = off); we use it to short-circuit when ``status`` parsing fails.
-* ``SYNO.Core.Package.Installation`` has a server-side install chain that
-  starts at ``install_from_server`` (downloads from the Synology repo) and
-  falls back to a download-then-install loop using a temp .spk in /tmp.
-  We document the contract here because the actual async polling shape
-  is observable only on a live install — schema verified against DSM 7.3.2
-  build 86009 maxVersion=2 (out-of-scope methods 102/103).
+* ``SYNO.Core.Package.Installation`` on DSM 7.3.2 (build 86009) uses the
+  verb ``install`` (or ``upgrade`` when the package is already present).
+  The canonical "online install" call shape — confirmed by reading
+  ``/usr/syno/synoman/webman/modules/PkgManApp/PkgManApp.js`` on CS3 — is
+
+      api:     "SYNO.Core.Package.Installation"
+      method:  "install"          # or "upgrade"
+      version: 1
+      params:  {name, is_syno, beta, url, checksum, filesize, type,
+                blqinst, operation}
+
+  The ``url`` / ``checksum`` / ``filesize`` / ``type`` / ``beta`` /
+  ``source`` fields are fetched from ``SYNO.Core.Package.Server`` ``list``
+  v2, which returns the public Synology package catalog row for the
+  target id. The DSM 6.x verb ``install_from_server`` does NOT exist on
+  DSM 7.3 and returns code 103 (method-not-supported) — we surfaced
+  this gap during the Phase 3 live run and the refactor here is the
+  fix.
 """
 from __future__ import annotations
 
@@ -414,28 +426,54 @@ def _extract_int(token: str) -> int | None:
 # DSM 7.3.2 schema notes (verified against CS3 build 86009):
 #
 # * ``SYNO.Core.Package.Installation`` maxVersion=2, minVersion=1.
-#   ``SYNO.Core.Package.Installation.check`` v1 returns a volume listing
+#   ``SYNO.Core.Package.Installation.check`` v2 returns a volume listing
 #   used by the AdminCenter UI to pick an install target; it does NOT
-#   touch the installation state. The mutating methods (``install``,
-#   ``download``, ``install_from_server``) are write-only and cannot be
-#   schema-introspected without an actual install.
+#   touch the installation state. The mutating method is ``install`` v1
+#   (or ``upgrade`` v1 when the package is already present). The DSM 6.x
+#   verb ``install_from_server`` does NOT exist on DSM 7.3 and returns
+#   code 103 (method-not-supported).
+# * ``SYNO.Core.Package.Installation.Download`` maxVersion=1. Used to
+#   poll an in-progress download task.
+# * ``SYNO.Core.Package.Server`` maxVersion=2, ``list`` v2 returns the
+#   public Synology package catalog as ``data.packages[]``, each row
+#   carrying ``{package, version, link, md5, size, type, beta, source,
+#   qinst, ...}``. We fetch this BEFORE the install call so we can
+#   feed those fields into the ``Installation.install`` payload.
 # * ``SYNO.Core.Package.Uninstallation`` maxVersion=1.
 # * ``SYNO.Core.Package.get`` v1 returns ``{id, name, version,
 #   additional.install_type, ...}`` for the installed package; 102/103
 #   for ``get`` against a not-installed id (caught + treated as
-#   "not installed").
+#   "not installed"). DSM 7.3 also surfaces code 4545 from Package
+#   Center's private range for the same condition — both are handled by
+#   :func:`_is_not_installed_error`.
 #
-# The fallback chain is documented in DESIGN.md §5.2: try
-# ``install_from_server`` first, fall back to a download-then-install
-# pair on DSM 1000-series errors. Polling is best-effort with bounded
-# retries because the actual async-state machine inside the DSM
-# installer is not formally documented.
+# Online install flow (DSM 7.3 canonical):
+#   1. ``Package.get`` → already installed? (idempotency / upgrade gate)
+#   2. ``Package.Server.list`` v2 → find the catalog row for the target.
+#   3. ``Package.Installation.install`` v1 with the full param set from
+#      step 2 (url/checksum/filesize/type/beta/blqinst/operation).
+#   4. ``Package.Installation.status`` v1 polling until ``finished=True``.
+#   5. ``Package.get`` again to confirm the installed version.
+#
+# spk_fallback flow (manual .spk upload, observed in the UI's
+# "Manual Install" wizard but not exercised live yet):
+#   1. ``Package.Installation.upload`` to push a .spk to the NAS.
+#   2. ``Package.Installation.install`` v1 with just
+#      ``{name, blqinst, volume_path, is_syno, beta, installrunpackage}``
+#      (no url/checksum/filesize — the file is already local).
+# We document this here for completeness; the implementation surfaces
+# the fallback only when the online path fails with a network/catalog
+# error (DSM 1000-series), and even then it currently relies on DSM
+# performing the .spk fetch itself — we do NOT upload a .spk from the
+# MCP process.
 
-# DSM 1000-series codes mean "install_from_server failed" — that's our
-# signal to fall back to the spk-download path. Specific codes seen
-# in the wild: 1000 (network error), 1004 (package not in catalog),
-# 1010 (no .spk for this DSM build).
-_INSTALL_FROM_SERVER_ERROR_RANGE = range(1000, 2000)
+# DSM 1000-series codes mean the online install failed — typically the
+# Synology download server was unreachable, the package wasn't in the
+# catalog, or no .spk matched this DSM build. We surface the code as a
+# warning but no longer attempt a download-then-install retry; the
+# fallback is documented above but not implemented (out of scope for
+# this gap-fix pass).
+_ONLINE_INSTALL_ERROR_RANGE = range(1000, 2000)
 
 # Polling parameters for the async install/uninstall task.
 _INSTALL_POLL_TIMEOUT_SECONDS = 300.0
@@ -580,6 +618,12 @@ async def _poll_install_task(
     carry ``finished=False`` as a terminal state. A timeout surfaces
     as a warning, not an exception — the caller decides whether to
     retry.
+
+    DSM 7.3 issues install task IDs in the form
+    ``@SYNOPKG_DOWNLOAD_<package_id>``. We pass the task_id straight
+    through; the AdminCenter UI uses both ``task_id`` and ``taskid`` as
+    the param name depending on the call site (``status`` accepts
+    ``task_id``, the Download API accepts ``taskid``).
     """
     import asyncio
     elapsed = 0.0
@@ -607,6 +651,75 @@ async def _poll_install_task(
     return last_body
 
 
+async def _fetch_server_catalog_row(
+    app_context, host: str, package_id: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Find the Synology-catalog row for `package_id` via Server.list v2.
+
+    Returns ``(row_or_None, raw_body)``. We scan both ``data.packages``
+    and ``data.beta_packages`` for the target id — DSM separates the
+    two but installs use the same call shape regardless.
+
+    A None row means the package is not in the catalog and we cannot
+    perform an online install. The caller surfaces that as a
+    ``not_in_catalog`` refusal (or a fallback path, eventually).
+    """
+    body = await call_dsm(
+        app_context, host,
+        api="SYNO.Core.Package.Server", method="list", version=2,
+    )
+    data = body.get("data") or {}
+    pools: list[list[Any]] = []
+    for key in ("packages", "beta_packages"):
+        candidate = data.get(key)
+        if isinstance(candidate, list):
+            pools.append(candidate)
+    for pool in pools:
+        for raw in pool:
+            if not isinstance(raw, dict):
+                continue
+            # ``package`` and ``id`` are usually identical but DSM
+            # historically populated one or the other depending on the
+            # client. Check both.
+            row_id = raw.get("package") or raw.get("id")
+            if row_id == package_id:
+                return raw, body
+    return None, body
+
+
+def _build_install_params(
+    catalog_row: dict[str, Any],
+    package_id: str,
+    *,
+    accept_eula: bool,
+) -> dict[str, Any]:
+    """Translate a catalog row into the ``Installation.install`` payload.
+
+    Mirrors the canonical payload produced by ``_onRequestDownload`` in
+    ``PkgManApp.js`` (CS3 / DSM 7.3.2 build 86009). All string values
+    are stringified at this layer; DSM is permissive about types but
+    consistent stringification avoids the occasional 400 from the JSON
+    parser on the server side.
+    """
+    is_syno = str(catalog_row.get("source") or "").lower() == "syno"
+    beta = bool(catalog_row.get("beta"))
+    qinst = bool(catalog_row.get("qinst"))
+    params: dict[str, Any] = {
+        "name": package_id,
+        "is_syno": "true" if is_syno else "false",
+        "beta": "true" if beta else "false",
+        "url": str(catalog_row.get("link") or ""),
+        "checksum": str(catalog_row.get("md5") or ""),
+        "filesize": str(catalog_row.get("size") or "0"),
+        "type": str(catalog_row.get("type") or "0"),
+        "blqinst": "true" if qinst else "false",
+        "operation": "install",
+    }
+    if accept_eula:
+        params["accept_eula"] = "true"
+    return params
+
+
 async def packages_install(
     host: str,
     package_id: str,
@@ -615,26 +728,35 @@ async def packages_install(
     *,
     app_context,
 ) -> dict:
-    """Install a package on `host`.
+    """Install a package on `host` using the DSM 7.3 canonical verb chain.
 
-    Implementation follows DESIGN.md §5.2:
+    Implementation follows the corrected DESIGN.md §5.2:
 
-      1. Pre-flight: check whether the package is already installed.
+      1. Pre-flight: ``Package.get`` to check whether the package is
+         already installed.
          - Same version: return ``ok=True, data.installed=False,
            warnings=["already at version X"]``.
          - Different version: refuse with
            ``category="upgrade_required"`` — MVP does not implement
            in-place upgrades.
-      2. ``SYNO.Core.Package.Installation install_from_server`` with
-         ``package=<id>`` (and ``version=<v>`` if provided).
-      3. If the response indicates an EULA is required and
-         ``accept_eula=False``, surface the EULA text under
-         ``data.eula_text`` and abort with ``category="eula_required"``.
-      4. On DSM error codes in [1000, 2000), fall back to the .spk
-         download chain: ``download`` -> ``install`` against the
-         downloaded path. Tracks completion via ``status`` polling.
-      5. Returns ``data.installed: bool, data.version: str,
-         data.method: "server" | "spk_fallback"``.
+      2. ``SYNO.Core.Package.Server.list`` v2 to fetch the public
+         catalog row for ``package_id`` (url / checksum / filesize /
+         type / source / beta). If the row is not present, refuse with
+         ``category="not_in_catalog"`` — the spk_fallback path is
+         documented but not implemented in this gap-fix pass.
+      3. ``SYNO.Core.Package.Installation.install`` v1 with the full
+         param set from step 2. The DSM 6.x verb ``install_from_server``
+         does NOT exist on 7.3 and was the original bug — see the
+         module docstring.
+      4. If the install response carries an EULA and ``accept_eula=False``,
+         surface ``category="eula_required"`` with the EULA text.
+      5. ``SYNO.Core.Package.Installation.status`` v1 polling.
+      6. ``Package.get`` again to confirm the installed version.
+
+    Returns ``data.installed: bool, data.version: str, data.method:
+    "online" | "noop"`` plus ``package_id``. The legacy ``"server"`` /
+    ``"spk_fallback"`` enum values from the pre-Phase-3-fix version are
+    no longer produced.
     """
     if not package_id:
         raise InvalidParam(
@@ -673,112 +795,88 @@ async def packages_install(
             "warnings": [],
         }
 
-    # --- install_from_server primary path ------------------------------------
-    params: dict[str, Any] = {"package": package_id}
-    if version:
-        params["version"] = version
-    if accept_eula:
-        params["accept_eula"] = "true"
+    # --- Fetch catalog row from Server.list ----------------------------------
+    catalog_row, server_body = await _fetch_server_catalog_row(
+        app_context, host, package_id,
+    )
+    warnings: list[str] = list(extract_warnings(server_body))
+    if catalog_row is None:
+        return {
+            "ok": False,
+            "host": host,
+            "data": {
+                "category": "not_in_catalog",
+                "package_id": package_id,
+                "next_step": (
+                    "the Synology package catalog (Server.list v2) does not "
+                    "contain this id for the current DSM build; verify the "
+                    "package_id spelling or install from a downloaded .spk "
+                    "via the DSM UI (spk_fallback is documented in the "
+                    "module docstring but not yet implemented)"
+                ),
+            },
+            "warnings": warnings,
+        }
+    # Sanity-check version. If the caller pinned a specific version and the
+    # catalog row offers a different one, refuse rather than silently
+    # installing the wrong build.
+    catalog_version = str(catalog_row.get("version") or "")
+    if version and catalog_version and catalog_version != version:
+        return {
+            "ok": False,
+            "host": host,
+            "data": {
+                "category": "version_mismatch",
+                "package_id": package_id,
+                "requested_version": version,
+                "catalog_version": catalog_version,
+                "next_step": (
+                    "Synology's online catalog only carries the latest "
+                    "version for this DSM build; specify version=None "
+                    "to install whatever the catalog offers, or fetch the "
+                    "exact version as a .spk manually"
+                ),
+            },
+            "warnings": warnings,
+        }
 
-    fallback_reason: str | None = None
+    # --- Online install via SYNO.Core.Package.Installation.install -----------
+    install_params = _build_install_params(
+        catalog_row, package_id, accept_eula=accept_eula,
+    )
     try:
-        server_body = await call_dsm(
+        install_body = await call_dsm(
             app_context, host,
             api="SYNO.Core.Package.Installation",
-            method="install_from_server", version=1,
-            params=params,
+            method="install", version=1,
+            params=install_params,
         )
     except Exception as exc:
         code = _extract_dsm_error_code(exc)
-        if code is not None and code in _INSTALL_FROM_SERVER_ERROR_RANGE:
-            fallback_reason = f"install_from_server failed with DSM {code}"
-            server_body = {}
-        else:
-            raise
-
-    if fallback_reason is None:
-        # EULA gate: surface eula_text if present and we haven't been told
-        # to accept.
-        eula_text = _extract_eula_text(server_body)
-        if eula_text and not accept_eula:
+        if code is not None and code in _ONLINE_INSTALL_ERROR_RANGE:
+            warnings.append(
+                f"online install failed with DSM {code} — the spk_fallback "
+                "path (manual .spk upload) is documented but not yet "
+                "implemented in this MCP"
+            )
             return {
                 "ok": False,
                 "host": host,
                 "data": {
-                    "category": "eula_required",
+                    "category": "online_install_failed",
                     "package_id": package_id,
-                    "eula_text": eula_text,
+                    "dsm_error_code": code,
                     "next_step": (
-                        "re-call with accept_eula=True to agree to the EULA "
-                        "and proceed"
+                        "retry later (transient network errors), or install "
+                        "manually via the DSM UI"
                     ),
                 },
-                "warnings": [],
+                "warnings": warnings,
             }
-        warnings: list[str] = list(extract_warnings(server_body))
-        # Optionally poll for completion if DSM returned a task_id.
-        data = server_body.get("data") or {}
-        task_id = data.get("task_id") or data.get("taskid")
-        if task_id:
-            final_body = await _poll_install_task(
-                app_context, host, str(task_id),
-            )
-            warnings.extend(extract_warnings(final_body))
-        # Verify install by re-checking via Package.get.
-        installed = await _get_installed_package(app_context, host, package_id)
-        installed_version = (
-            str(installed.get("version") or "") if installed else ""
-        )
-        return success_envelope(
-            host,
-            {
-                "installed": True,
-                "version": installed_version,
-                "method": "server",
-                "package_id": package_id,
-            },
-            warnings,
-        )
+        raise
 
-    # --- .spk fallback chain -------------------------------------------------
-    # NOTE: The download/install flow against a local .spk is verified by
-    # the DSM AdminCenter UI but cannot be fully schema-checked from
-    # READ-ONLY calls. We document the canonical shape per DESIGN.md
-    # §5.2 and accept whatever DSM returns at runtime.
-    download_params: dict[str, Any] = {"package": package_id}
-    if version:
-        download_params["version"] = version
-    download_body = await call_dsm(
-        app_context, host,
-        api="SYNO.Core.Package.Installation",
-        method="download", version=1,
-        params=download_params,
-    )
-    warnings: list[str] = [fallback_reason] if fallback_reason else []
-    warnings.extend(extract_warnings(download_body))
-    download_data = download_body.get("data") or {}
-    download_task = download_data.get("task_id") or download_data.get("taskid")
-    spk_path = download_data.get("path") or download_data.get("file_path")
-    if download_task:
-        poll_body = await _poll_install_task(
-            app_context, host, str(download_task),
-        )
-        warnings.extend(extract_warnings(poll_body))
-        poll_data = poll_body.get("data") or {}
-        spk_path = poll_data.get("path") or spk_path
-
-    install_params: dict[str, Any] = {"package": package_id}
-    if spk_path:
-        install_params["path"] = spk_path
-    if accept_eula:
-        install_params["accept_eula"] = "true"
-
-    install_body = await call_dsm(
-        app_context, host,
-        api="SYNO.Core.Package.Installation",
-        method="install", version=1,
-        params=install_params,
-    )
+    # EULA gate: surface ``eula_text`` if present and we haven't been told
+    # to accept.
     eula_text = _extract_eula_text(install_body)
     if eula_text and not accept_eula:
         return {
@@ -795,16 +893,17 @@ async def packages_install(
             },
             "warnings": warnings,
         }
-    warnings.extend(extract_warnings(install_body))
 
+    warnings.extend(extract_warnings(install_body))
     install_data = install_body.get("data") or {}
-    install_task = install_data.get("task_id") or install_data.get("taskid")
-    if install_task:
+    task_id = install_data.get("task_id") or install_data.get("taskid")
+    if task_id:
         final_body = await _poll_install_task(
-            app_context, host, str(install_task),
+            app_context, host, str(task_id),
         )
         warnings.extend(extract_warnings(final_body))
 
+    # Verify install by re-checking via Package.get.
     installed = await _get_installed_package(app_context, host, package_id)
     installed_version = (
         str(installed.get("version") or "") if installed else ""
@@ -814,7 +913,7 @@ async def packages_install(
         {
             "installed": True,
             "version": installed_version,
-            "method": "spk_fallback",
+            "method": "online",
             "package_id": package_id,
         },
         warnings,

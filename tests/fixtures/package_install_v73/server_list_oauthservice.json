@@ -1,0 +1,50 @@
+{
+  "success": true,
+  "data": {
+    "packages": [
+      {
+        "beta": false,
+        "breakpkgs": null,
+        "category": ["utilities"],
+        "conflictpkgs": null,
+        "deppkgs": null,
+        "desc": "OAuth Service is an open standard protocol for account authorization and authentication.",
+        "dname": "OAuth Service",
+        "id": "OAuthService",
+        "install_type": "system",
+        "link": "https://global.synologydownload.com/download/Package/spk/OAuthService/1.2.0-0163/OAuthService-x86_64-1.2.0-0163.spk",
+        "md5": "0d9f0f3dbf940be44b48d9ed19cd83a7",
+        "package": "OAuthService",
+        "qinst": true,
+        "qstart": true,
+        "qupgrade": true,
+        "size": 548384,
+        "source": "syno",
+        "type": 0,
+        "version": "1.2.0-0163"
+      },
+      {
+        "beta": false,
+        "breakpkgs": null,
+        "category": ["business"],
+        "conflictpkgs": null,
+        "deppkgs": null,
+        "desc": "LogCenter manages logs.",
+        "dname": "Log Center",
+        "id": "LogCenter",
+        "install_type": "system",
+        "link": "https://global.synologydownload.com/download/Package/spk/LogCenter/1.0.0-0000/LogCenter-x86_64-1.0.0-0000.spk",
+        "md5": "deadbeefdeadbeefdeadbeefdeadbeef",
+        "package": "LogCenter",
+        "qinst": true,
+        "size": 1048576,
+        "source": "syno",
+        "type": 0,
+        "version": "1.0.0-0000"
+      }
+    ],
+    "beta_packages": [],
+    "categories": [],
+    "banners": []
+  }
+}

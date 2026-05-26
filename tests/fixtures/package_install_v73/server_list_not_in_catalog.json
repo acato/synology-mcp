@@ -1,0 +1,21 @@
+{
+  "success": true,
+  "data": {
+    "packages": [
+      {
+        "beta": false,
+        "id": "SomeOtherPackage",
+        "package": "SomeOtherPackage",
+        "version": "1.0.0",
+        "link": "https://example.com/SomeOtherPackage.spk",
+        "md5": "00000000000000000000000000000000",
+        "size": 100,
+        "source": "syno",
+        "type": 0
+      }
+    ],
+    "beta_packages": [],
+    "categories": [],
+    "banners": []
+  }
+}

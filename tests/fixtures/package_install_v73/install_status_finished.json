@@ -1,0 +1,9 @@
+{
+  "success": true,
+  "data": {
+    "finished": true,
+    "status": "done",
+    "progress": 1.0,
+    "taskid": "@SYNOPKG_DOWNLOAD_OAuthService"
+  }
+}
