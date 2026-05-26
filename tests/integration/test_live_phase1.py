@@ -124,6 +124,8 @@ async def test_live_raid_state(live_app_ctx: AppContext) -> None:
 
 @pytest.mark.asyncio
 async def test_live_raid_hardware_info(live_app_ctx: AppContext) -> None:
+    import re as _re
+
     host = next(iter(live_app_ctx.config.hosts))
     result = await raid.raid_hardware_info(host, app_context=live_app_ctx)
     assert result["ok"] is True
@@ -131,6 +133,22 @@ async def test_live_raid_hardware_info(live_app_ctx: AppContext) -> None:
     # Real DSM always reports model + DSM version + serial.
     assert data["model"] != "unknown"
     assert data["dsm_version"] != "unknown"
+    # nics[].mac must be cross-filled from sysfs: a valid lowercase MAC for
+    # every active interface, or None (NEVER the empty string) for inactive
+    # ones. At least one active NIC must report a real MAC.
+    nics = data["nics"]
+    assert isinstance(nics, list)
+    assert len(nics) >= 1
+    mac_re = _re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+    for nic in nics:
+        assert nic["mac"] is None or mac_re.match(nic["mac"]), (
+            f"invalid mac for {nic['name']!r}: {nic['mac']!r}"
+        )
+        assert nic["mac"] != "", "empty string leaked into nics[].mac"
+    active = [n for n in nics if n["status"] == "up" and n["name"].startswith("eth")]
+    assert active, "no active eth* interface returned"
+    assert active[0]["mac"] is not None
+    assert mac_re.match(active[0]["mac"])
 
 
 @pytest.mark.asyncio

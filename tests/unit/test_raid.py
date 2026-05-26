@@ -141,6 +141,38 @@ async def test_raid_hardware_info_success(app_ctx, fixture_json) -> None:
     _seed_session(app_ctx)
     sys_payload = fixture_json("system_info", "info_ds1825plus.json")
     nic_payload = fixture_json("network_interface", "list_normal.json")
+    # raid_hardware_info now delegates NIC enumeration to
+    # network_list_interfaces, which combines the web API with /sys/class/net
+    # over SSH. Mock both transports.
+    sysfs_replies = {
+        "eth0": (
+            "address=00:00:5e:00:53:01\nspeed=1000\noperstate=up\n"
+            "mtu=1500\nduplex=full\ncarrier=1\n"
+        ),
+        "eth1": (
+            "address=00:00:5e:00:53:02\nspeed=-1\noperstate=down\n"
+            "mtu=1500\nduplex=full\ncarrier=0\n"
+        ),
+        "eth2": (
+            "address=90:09:d0:95:ed:26\nspeed=10000\noperstate=up\n"
+            "mtu=9000\nduplex=full\ncarrier=1\n"
+        ),
+        "pppoe": (
+            "address=00:00:00:00:00:00\nspeed=0\noperstate=down\n"
+            "mtu=1500\nduplex=full\ncarrier=0\n"
+        ),
+    }
+    fake_ssh = MagicMock(spec=DSMSshClient)
+
+    async def _run(command, *_, **__):
+        # Extract the interface name from the multi-line sysfs probe.
+        for name, reply in sysfs_replies.items():
+            if f"/sys/class/net/{name}/" in command:
+                return SshResult(command=command, stdout=reply, stderr="", exit_status=0)
+        return SshResult(command=command, stdout="", stderr="", exit_status=0)
+    fake_ssh.run = AsyncMock(side_effect=_run)
+    app_ctx.cache.get("testhost").ssh_client = fake_ssh
+
     with respx.mock(base_url="https://192.0.2.10:5001") as mock:
         # First call -> system info, second call -> network interface list.
         mock.get("/webapi/entry.cgi").mock(
@@ -158,10 +190,47 @@ async def test_raid_hardware_info_success(app_ctx, fixture_json) -> None:
     assert data["cpu_cores"] == 4
     # ram_size=8192 MB -> 8 GiB in bytes
     assert data["ram_total_bytes"] == 8192 * 1024 * 1024
-    # NIC table pulled from the network endpoint (top-level list shape).
+    # NIC table pulled from network_list_interfaces (web API + sysfs).
     assert len(data["nics"]) >= 3
     eth0 = next(n for n in data["nics"] if n["name"] == "eth0")
-    assert eth0["status"] == "connected"
+    # status reflects the normalised link state ("up" / "down").
+    assert eth0["status"] == "up"
+    # MAC is cross-filled from sysfs — never the empty string.
+    assert eth0["mac"] == "00:00:5e:00:53:01"
+    eth2 = next(n for n in data["nics"] if n["name"] == "eth2")
+    assert eth2["mac"] == "90:09:d0:95:ed:26"
+    assert eth2["speed_mbps"] == 10000
+
+
+@pytest.mark.asyncio
+async def test_raid_hardware_info_mac_is_null_when_unavailable(
+    app_ctx, fixture_json,
+) -> None:
+    """When sysfs is unreachable and the web API has no MAC, mac must be None
+    (not the empty string)."""
+    _seed_session(app_ctx)
+    sys_payload = fixture_json("system_info", "info_ds1825plus.json")
+    nic_payload = fixture_json("network_interface", "list_normal.json")
+    from synology_mcp.errors import DSMSshError
+    fake_ssh = MagicMock(spec=DSMSshClient)
+
+    async def _run(command, *_, **__):
+        raise DSMSshError("ssh down", host="testhost", command=command)
+    fake_ssh.run = AsyncMock(side_effect=_run)
+    app_ctx.cache.get("testhost").ssh_client = fake_ssh
+
+    with respx.mock(base_url="https://192.0.2.10:5001") as mock:
+        mock.get("/webapi/entry.cgi").mock(
+            side_effect=[
+                httpx.Response(200, json=sys_payload),
+                httpx.Response(200, json=nic_payload),
+            ]
+        )
+        result = await raid.raid_hardware_info("testhost", app_context=app_ctx)
+    # network_interface fixture carries no MAC field — combined with sysfs
+    # failure, every NIC should report mac=None.
+    for nic in result["data"]["nics"]:
+        assert nic["mac"] is None, f"empty string leaked for {nic['name']!r}"
 
 
 # ---------- raid_state (mdstat over SSH) ------------------------------------

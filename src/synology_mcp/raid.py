@@ -17,8 +17,28 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from . import network as _network
 from ._helpers import call_dsm, get_ssh_client, success_envelope
 from .transport.http import extract_warnings
+
+_MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+
+
+def _coerce_mac(raw: object) -> str | None:
+    """Normalise a MAC string. Returns the lowercase address or None.
+
+    DSM and sysfs both emit ``xx:xx:xx:xx:xx:xx`` form, but the web API
+    sometimes hands back the empty string for interfaces it doesn't track
+    (pppoe, virtual). Use ``None`` (not ``""``) for "genuinely unavailable".
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip().lower()
+    if not s:
+        return None
+    if not _MAC_RE.match(s):
+        return None
+    return s
 
 # --- Unified storage payload ------------------------------------------------
 #
@@ -328,8 +348,11 @@ def _normalize_dsm_build(data: dict[str, Any]) -> str:
 async def raid_hardware_info(host: str, *, app_context) -> dict:
     """Return model, DSM build, serial, RAM, CPU, and NIC table.
 
-    NIC table is sourced from `SYNO.Core.Network.Interface` (the system endpoint
-    does not include link info on DSM 7.3); a single extra call is cheap.
+    NIC table is delegated to :func:`network.network_list_interfaces` — same
+    code path as `network_list_interfaces` so MAC addresses (which come from
+    `/sys/class/net/<if>/address` over SSH, NOT from the web API) are filled
+    in consistently. `nics[].mac` is a lowercase ``xx:xx:xx:xx:xx:xx`` string
+    or ``None`` if genuinely unavailable — never the empty string.
     """
     body = await call_dsm(
         app_context, host,
@@ -354,31 +377,34 @@ async def raid_hardware_info(host: str, *, app_context) -> dict:
         "ram_total_bytes": ram_bytes,
         "nics": [],
     }
-    # NIC table — pull from the network endpoint for fresh link info.
+    warnings: list[str] = list(extract_warnings(body))
+    # NIC table — reuse network_list_interfaces (web API + sysfs cross-check)
+    # so MACs and link state come from the same canonical source.
     try:
-        nic_body = await call_dsm(
-            app_context, host,
-            api="SYNO.Core.Network.Interface", method="list", version=1,
+        nic_envelope = await _network.network_list_interfaces(
+            host, app_context=app_context,
         )
     except Exception:
-        nic_body = None
-    if nic_body is not None:
-        nic_data = nic_body.get("data")
-        nics_raw = nic_data if isinstance(nic_data, list) else []
-        for n in nics_raw:
-            if not isinstance(n, dict):
+        nic_envelope = None
+    if nic_envelope is not None:
+        for iface in nic_envelope.get("data", {}).get("interfaces", []):
+            if not isinstance(iface, dict):
                 continue
+            ips = iface.get("ips") or []
+            primary_ip = next((str(ip) for ip in ips if ip), "")
             info["nics"].append(
                 {
-                    "name": str(n.get("ifname") or n.get("name") or n.get("device") or ""),
-                    "mac": str(n.get("mac") or n.get("hardware_address") or ""),
-                    "speed_mbps": _int_or_none(n.get("speed")),
-                    "ip": str(n.get("ip") or n.get("addr") or ""),
-                    "type": str(n.get("type") or "ethernet"),
-                    "status": str(n.get("status") or ""),
+                    "name": str(iface.get("name") or ""),
+                    "mac": _coerce_mac(iface.get("mac")),
+                    "speed_mbps": _int_or_none(iface.get("speed_mbps")),
+                    "ip": primary_ip,
+                    "type": str(iface.get("type") or "ethernet"),
+                    "status": str(iface.get("state") or ""),
                 }
             )
-    return success_envelope(host, info, extract_warnings(body))
+        # Surface any warnings the network layer raised (e.g. speed mismatch).
+        warnings.extend(nic_envelope.get("warnings", []) or [])
+    return success_envelope(host, info, warnings)
 
 
 # --- Helpers ----------------------------------------------------------------

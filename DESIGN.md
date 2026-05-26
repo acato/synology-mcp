@@ -324,6 +324,8 @@ Parses `/proc/mdstat` over SSH. For each `md<N>` device returns:
 
 Model, DSM build, serial number, total RAM, CPU model, and full NIC table.
 
+The NIC table is sourced from `network_list_interfaces` so MACs and link state come from the same canonical web-API+sysfs cross-check (`/sys/class/net/<if>/address` over SSH). `nics[].mac` is a lowercase `xx:xx:xx:xx:xx:xx` string or `null` if genuinely unavailable — never the empty string. `nics[].status` carries the normalised link state (`up`/`down`).
+
 ### 5.7 ssh_*
 
 #### `ssh_get_state(host)`
