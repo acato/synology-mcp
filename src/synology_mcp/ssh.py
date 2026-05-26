@@ -4,8 +4,8 @@
 
 This module ships the write half of the ``ssh_*`` tool family:
 
-  * :func:`ssh_add_authorized_key`    — Phase 3a, this commit.
-  * :func:`ssh_remove_authorized_key` — Phase 3a, follow-up commit.
+  * :func:`ssh_add_authorized_key`    — Phase 3a.
+  * :func:`ssh_remove_authorized_key` — Phase 3a, this commit.
   * :func:`ssh_enable_user_ssh`       — Phase 3a, follow-up commit.
 
 Read-only ``ssh_get_state`` / ``ssh_list_authorized_keys`` and
@@ -126,6 +126,44 @@ def _fingerprint_sha256(key_bytes: bytes) -> str:
     digest = hashlib.sha256(key_bytes).digest()
     b64 = base64.b64encode(digest).decode("ascii").rstrip("=")
     return f"SHA256:{b64}"
+
+
+def _normalize_fingerprint(fingerprint: str) -> str:
+    """Accept fingerprints with or without the ``SHA256:`` prefix.
+
+    Returns the canonical ``SHA256:<b64-nopad>`` form. Raises
+    ``InvalidParam`` for clearly malformed values (empty, MD5-style,
+    base64 with the wrong length, base64 with bad alphabet).
+    """
+    if not isinstance(fingerprint, str) or not fingerprint.strip():
+        raise InvalidParam(
+            "fingerprint must be a non-empty string",
+            details={"param": "fingerprint"},
+        )
+    fp = fingerprint.strip()
+    if fp.lower().startswith("md5:"):
+        raise InvalidParam(
+            "MD5 fingerprints are not supported -- pass the SHA256 form",
+            details={"param": "fingerprint"},
+        )
+    body = fp.split(":", 1)[1] if fp.upper().startswith("SHA256:") else fp
+    body = body.rstrip("=")
+    # SHA256 over a non-empty input -> 32 bytes -> 43 chars unpadded base64.
+    if len(body) != 43:
+        raise InvalidParam(
+            "fingerprint does not look like a SHA256 base64 digest "
+            f"(expected 43 base64 chars, got {len(body)})",
+            details={"param": "fingerprint"},
+        )
+    # Validate the base64 alphabet without forcing padding.
+    try:
+        base64.b64decode(body + "=", validate=True)
+    except (ValueError, TypeError) as exc:
+        raise InvalidParam(
+            f"fingerprint base64 is malformed: {exc}",
+            details={"param": "fingerprint"},
+        ) from exc
+    return f"SHA256:{body}"
 
 
 # ---------------------------------------------------------------------------
@@ -377,4 +415,58 @@ async def ssh_add_authorized_key(
     )
 
 
-__all__ = ["ssh_add_authorized_key"]
+# ---------------------------------------------------------------------------
+# Tool: ssh_remove_authorized_key
+# ---------------------------------------------------------------------------
+
+
+async def ssh_remove_authorized_key(
+    host: str, user: str, fingerprint: str, *, app_context,
+) -> dict:
+    """Remove all keys whose SHA256 fingerprint matches `fingerprint`.
+
+    Idempotent: a fingerprint that's not present returns ``ok=True`` with
+    ``data.removed_count=0`` (and no warnings). Order of the remaining
+    keys is preserved exactly. Lines we can't parse (garbage, custom
+    options, etc.) are preserved untouched — we never silently rewrite
+    state we don't understand.
+    """
+    _validate_username(user, host=host)
+    target_fp = _normalize_fingerprint(fingerprint)
+    ssh = get_ssh_client(app_context, host)
+    existing_blob = await _read_authorized_keys(ssh, user)
+    existing_entries = _split_authorized_keys(existing_blob)
+
+    kept: list[str] = []
+    removed_count = 0
+    for entry in existing_entries:
+        try:
+            _, ek_bytes, _ = _parse_pubkey(entry)
+        except InvalidParam:
+            # Malformed entry — preserve it untouched. We're not in the
+            # business of cleaning up the file behind the user's back.
+            kept.append(entry)
+            continue
+        if _fingerprint_sha256(ek_bytes) == target_fp:
+            removed_count += 1
+            continue
+        kept.append(entry)
+
+    if removed_count == 0:
+        return success_envelope(
+            host,
+            {"removed_count": 0, "fingerprint": target_fp, "user": user},
+        )
+
+    await _write_authorized_keys(ssh, user, _join_authorized_keys(kept))
+    return success_envelope(
+        host,
+        {
+            "removed_count": removed_count,
+            "fingerprint": target_fp,
+            "user": user,
+        },
+    )
+
+
+__all__ = ["ssh_add_authorized_key", "ssh_remove_authorized_key"]
