@@ -881,18 +881,24 @@ async def test_live_shares_create_delete_roundtrip(
 #   * DSM 7.3's ``SYNO.Core.Package.Installation.install_from_server``
 #     method DOES NOT EXIST -- DSM 103 (method not supported). The real
 #     install verb on DSM 7.3 is ``install`` (or ``upgrade``), called
-#     with ``{name, is_syno, url, checksum, filesize, ...}`` per the
-#     AdminCenter PkgManApp source. ``packages_install`` happy path
-#     therefore cannot run live against CS4 until the implementation is
-#     refactored to the real method name (tracked as a DSM-7.3 surprise
-#     in the Phase 3 final report). We do NOT test the happy path live
-#     in this suite; idempotent-already-installed + denylist + not-
-#     installed cover the rest.
+#     with ``{name, is_syno, url, checksum, filesize, type, blqinst,
+#     operation}`` per the AdminCenter PkgManApp source. Phase 3 gap-fix
+#     pass refactored ``packages_install`` to the real verb chain
+#     (``Package.Server.list`` -> ``Package.Installation.install`` ->
+#     ``Package.Installation.status``); the live install round-trip
+#     below exercises that refactor end-to-end.
 #
 #   * DSM ``SYNO.Core.Package.get`` returns code 4545 (Package Center
 #     "not installed") for unknown package_ids, not the 10x family the
 #     implementation originally expected. The fix landed in this commit
 #     -- ``_is_not_installed_error`` now matches by code 4545 as well.
+#
+#   * The Phase 3 spec proposed OAuthService as the install round-trip
+#     target, but the CS4 baseline already has OAuthService pre-installed
+#     (DSM ships it on most systems). The actual install round-trip
+#     therefore targets ``LogCenter`` -- validated absent from the CS4
+#     baseline and present in the Synology online catalog. OAuthService
+#     is still used as the "already installed" idempotency probe (5a).
 #
 # What we test live:
 #   * 5a — packages_install on the pre-installed OAuthService returns
@@ -902,7 +908,11 @@ async def test_live_shares_create_delete_roundtrip(
 #   * 5c — packages_uninstall on a not-installed package
 #          (LogCenter, validated as absent from baseline) returns
 #          ok=True, uninstalled=False, "package not installed" warning.
-#          This exercises the 4545-handling fix end-to-end.
+#          Exercises the 4545-handling fix end-to-end.
+#   * 5d — packages_install round-trip on LogCenter:
+#          install -> verify (installed=True, method=online) ->
+#          uninstall -> verify gone. Exercises the DSM 7.3 'install'
+#          verb refactor (Gap 1 fix).
 
 
 _PREINSTALLED_TARGET = "OAuthService"
@@ -963,19 +973,70 @@ async def test_live_packages_idempotent_and_denylist(
     ), f"missing not-installed warning: {not_installed['warnings']}"
 
 
-@pytest.mark.skip(
-    reason=(
-        "DSM 7.3 install happy-path blocked: SYNO.Core.Package.Installation."
-        "install_from_server does not exist on DSM 7.3.2 build 86009 "
-        "(returns code 103 method-not-supported). The real DSM 7.3 verb "
-        "is `install` (or `upgrade`) with params {name, is_syno, url, "
-        "checksum, filesize, type, blqinst, operation}. Implementation "
-        "refactor required before this can run live -- documented as a "
-        "DSM-7.3 surprise in the Phase 3 final report."
-    ),
-)
 @pytest.mark.asyncio
-async def test_live_packages_install_happy_path_BLOCKED(
-    live_app_ctx: AppContext,
+async def test_live_packages_install_uninstall_roundtrip(
+    live_app_ctx: AppContext, baseline: dict[str, object],
 ) -> None:
-    """Skipped pending implementation refactor (see skip reason)."""
+    """5d — install LogCenter -> verify -> uninstall -> verify gone.
+
+    Exercises the Gap 1 ``packages_install`` refactor (DSM 7.3
+    ``Installation.install`` verb instead of the broken
+    ``install_from_server``) and the matching ``packages_uninstall``
+    pair. Targets LogCenter because:
+
+      * Absent from CS4 baseline (pre-flight asserts).
+      * Present in the Synology online catalog (Server.list v2
+        returns a row with link/md5/size).
+      * Not on the denylist.
+      * Small (~3MB) — install + uninstall in well under a minute.
+
+    Post-flight: assert LogCenter is gone again so the baseline
+    drift check at module teardown still passes.
+    """
+    host = next(iter(live_app_ctx.config.hosts))
+    target = _NEVER_INSTALLED_TARGET
+    # Sanity: baseline was captured before this test; double-check the
+    # live state right now to catch a leak from a prior aborted run.
+    pre = await _read_package_ids(live_app_ctx, host)
+    assert target not in pre, (
+        f"{target!r} unexpectedly present at the start of the install "
+        f"round-trip test -- leftover from a prior failed run?"
+    )
+
+    install_done = False
+    try:
+        # ----- 5d.1) install ----------------------------------------------
+        install = await packages.packages_install(
+            host, target, accept_eula=True, app_context=live_app_ctx,
+        )
+        assert install["ok"] is True, install
+        assert install["data"]["installed"] is True, install
+        assert install["data"]["method"] == "online", install
+        assert install["data"]["package_id"] == target
+        install_done = True
+
+        # ----- 5d.2) verify it now shows in synopkg list ------------------
+        after_install = await _read_package_ids(live_app_ctx, host)
+        assert target in after_install, (
+            f"{target!r} not in synopkg list after install: {after_install}"
+        )
+
+    finally:
+        # ----- 5d.3) uninstall -- ALWAYS run, even if install asserted ---
+        # If install partially succeeded we still need to clean up;
+        # if it didn't run the package isn't there and uninstall is a
+        # no-op (idempotent).
+        uninstall = await packages.packages_uninstall(
+            host, target, app_context=live_app_ctx,
+        )
+        # uninstall must succeed -- it's idempotent so even "wasn't
+        # installed" returns ok=True.
+        assert uninstall["ok"] is True, uninstall
+        if install_done:
+            assert uninstall["data"]["uninstalled"] is True, uninstall
+
+        # ----- 5d.4) verify gone -----------------------------------------
+        after_uninstall = await _read_package_ids(live_app_ctx, host)
+        assert target not in after_uninstall, (
+            f"{target!r} still installed after uninstall: {after_uninstall}"
+        )
