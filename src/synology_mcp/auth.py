@@ -12,10 +12,15 @@ Key DSM quirks handled here:
     BOTH must accompany subsequent calls or DSM returns 105/119.
   - 2FA via `otp_code` param; some DSM builds require `format=cookie`.
   - Sessions silently expire — callers must be able to retry-once-on-401.
+  - DSM major/minor (e.g. (7, 3)) is fetched once via `SYNO.Core.System` info
+    on first login and cached on the session, so the §9 compat shim can
+    dispatch (`_normalize_v73_*` vs `_normalize_v72_*`) without re-querying.
 """
 from __future__ import annotations
 
 import contextlib
+import logging
+import re
 from typing import TYPE_CHECKING
 
 import httpx
@@ -23,6 +28,12 @@ import httpx
 from .errors import AuthFailed, OtpRequired, raise_for_dsm_error
 from .session import DSMSession
 from .transport.http import DSMHttpClient
+
+_log = logging.getLogger(__name__)
+
+# Matches the leading "DSM <major>.<minor>" in firmware_ver strings such as
+# "DSM 7.3.2-86009 Update 3" or "DSM 7.2-64570".
+_DSM_VERSION_RE = re.compile(r"DSM\s+(?P<major>\d+)\.(?P<minor>\d+)")
 
 if TYPE_CHECKING:  # pragma: no cover
     from .config import HostConfig
@@ -124,7 +135,54 @@ async def perform_login(
         cookies={"id": sid},
     )
     state.session = session
+    # Populate DSM major/minor so the §9 compat shim can dispatch without
+    # re-querying. Best-effort: a failure here just leaves the field as None
+    # and the shim falls back to its default normaliser.
+    session.dsm_major_minor = await _fetch_dsm_major_minor(http, session, host_cfg.name)
     return session
+
+
+async def _fetch_dsm_major_minor(
+    http: DSMHttpClient,
+    session: DSMSession,
+    host_name: str,
+) -> tuple[int, int] | None:
+    """Query DSM for its version and parse out (major, minor).
+
+    Uses `SYNO.Core.System` info — same endpoint as `raid_hardware_info` — and
+    reads the leading "DSM <major>.<minor>" out of the `firmware_ver` string.
+    Failures (transport error, unexpected payload shape, unparseable version)
+    return None so the caller can continue without the field populated.
+
+    This costs one extra HTTP roundtrip on first login per host. Subsequent
+    calls reuse the cached value on the session.
+    """
+    try:
+        body = await http.call(
+            api="SYNO.Core.System",
+            method="info",
+            version=1,
+            session=session,
+            raise_on_dsm_error=False,
+        )
+    except Exception as exc:  # pragma: no cover - logged + best-effort
+        _log.warning(
+            "could not fetch DSM version for host=%s: %s", host_name, exc,
+        )
+        return None
+    if not body.get("success", False):
+        return None
+    data = body.get("data") or {}
+    fw = data.get("firmware_ver") or data.get("version") or ""
+    if not isinstance(fw, str):
+        return None
+    m = _DSM_VERSION_RE.search(fw)
+    if not m:
+        return None
+    try:
+        return (int(m.group("major")), int(m.group("minor")))
+    except (TypeError, ValueError):  # pragma: no cover - regex guarantees ints
+        return None
 
 
 async def ensure_session(

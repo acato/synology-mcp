@@ -62,6 +62,11 @@ async def test_live_auth_login(live_app_ctx: AppContext) -> None:
     assert result["data"]["sid_present"] is True
     # Token may or may not be present depending on DSM build.
     assert "issued_at" in result["data"]
+    # DSM major/minor was populated during login. CS3 runs DSM 7.3.
+    assert result["data"]["dsm_major_minor"] == [7, 3]
+    state = live_app_ctx.cache.get(host)
+    assert state.session is not None
+    assert state.session.dsm_major_minor == (7, 3)
 
 
 @pytest.mark.asyncio
@@ -71,6 +76,8 @@ async def test_live_auth_whoami_after_login(live_app_ctx: AppContext) -> None:
     result = await auth.auth_whoami(host, app_context=live_app_ctx)
     assert result["ok"] is True
     assert result["data"]["user"] == live_app_ctx.config.hosts[host].account
+    # Cached version field survives whoami.
+    assert result["data"]["dsm_major_minor"] == [7, 3]
 
 
 @pytest.mark.asyncio

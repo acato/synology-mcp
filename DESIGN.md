@@ -119,9 +119,16 @@ class DSMSession:
     user: str
     issued_at: datetime
     expires_at: datetime | None  # DSM doesn't advertise this; we track soft-expiry
+    dsm_major_minor: tuple[int, int] | None  # e.g. (7, 3); see version-fetch below
 ```
 
 Session invalidation triggers: explicit `auth.logout`, DSM error 119/105/107 on any call, process shutdown.
+
+### DSM version fetch
+
+Immediately after `SYNO.API.Auth login` succeeds, `perform_login` issues a follow-up `SYNO.Core.System info` call and parses the leading `DSM <major>.<minor>` out of the `firmware_ver` string (e.g. `"DSM 7.3.2-86009 Update 3"` → `(7, 3)`). The result is cached on the session as `dsm_major_minor`. The §9 compat shim reads this field to dispatch between `_normalize_v73_*` and `_normalize_v72_*` paths without re-querying DSM.
+
+This costs one additional HTTP roundtrip on first login per host. Failures (transport error, unexpected payload shape, unparseable version) are non-fatal: the field stays `None` and the compat shim falls back to its current default normaliser. The session's `descriptor()` exposes the value to MCP consumers as a 2-element list (or `None`).
 
 ---
 
