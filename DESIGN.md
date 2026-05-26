@@ -9,14 +9,14 @@
 3. [Auth state and session caching](#3-auth-state-and-session-caching)
 4. [Error handling and retry policy](#4-error-handling-and-retry-policy)
 5. [Tool surface](#5-tool-surface)
-   1. [auth.*](#51-auth)
-   2. [packages.*](#52-packages)
-   3. [user_home.*](#53-user_home)
-   4. [snapshot_replication.*](#54-snapshot_replication)
-   5. [shares.*](#55-shares)
-   6. [raid.*](#56-raid)
-   7. [ssh.*](#57-ssh)
-   8. [network.*](#58-network)
+   1. [auth_*](#51-auth)
+   2. [packages_*](#52-packages)
+   3. [user_home_*](#53-user_home)
+   4. [snapshot_replication_*](#54-snapshot_replication)
+   5. [shares_*](#55-shares)
+   6. [raid_*](#56-raid)
+   7. [ssh_*](#57-ssh)
+   8. [network_*](#58-network)
 6. [Configuration](#6-configuration)
 7. [DSM API mapping](#7-dsm-api-mapping)
 8. [Testing strategy](#8-testing-strategy)
@@ -82,9 +82,9 @@ Each subsystem module declares MCP tools via a thin decorator (`@tool` in `tools
 
 State lives in `session.py`'s `SessionCache`:
 
-- One `httpx.AsyncClient` per host (TLS verify settings come from config).
-- One `DSMSession` per host (sid + syno_token + expiry + cookies).
-- Paramiko SSH connections opened lazily and pooled.
+- One `httpx.AsyncClient` per host, cached for the full process lifetime (TLS verify settings come from config). No idle timer; reconnect only on auth error or socket error.
+- One `DSMSession` per host (sid + syno_token + cookies + issued_at). Invalidated on DSM 105/107/119, on explicit `auth_logout`, and on process shutdown.
+- One `paramiko.SSHClient` per host, cached for the process lifetime with `transport.set_keepalive(60)` to defeat Synology's 10-15 min idle disconnect. Transparent reconnect on channel error.
 
 There is no global state outside `SessionCache` and the config loader. The MCP process can serve calls against arbitrary hosts concurrently with no interference.
 
@@ -157,7 +157,7 @@ All retries log a structured warning with `host`, `endpoint`, `attempt`, and `ds
 
 ## 5. Tool surface
 
-Every tool name is prefixed with its module (e.g., `auth.login`, `packages.install`). All tools are async. All take `host: str` as the first positional argument. All return a `dict` with at minimum:
+Every tool name is **flat snake_case** with a module prefix (e.g., `auth_login`, `packages_install`, `raid_list_volumes`). MCP clients see one flat namespace. All tools are async. All take `host: str` as the first positional argument. All return a `dict` with at minimum:
 
 ```python
 {
@@ -170,9 +170,9 @@ Every tool name is prefixed with its module (e.g., `auth.login`, `packages.insta
 
 On failure, the MCP returns a JSON-RPC error with a structured `data` field carrying `dsm_error_code` (when applicable) and `category` (`auth`, `network`, `permission`, `unsupported`, `validation`, `internal`).
 
-### 5.1 auth.*
+### 5.1 auth_*
 
-#### `auth.login(host)`
+#### `auth_login(host)`
 
 Force a fresh login (invalidates any cached session first). Returns:
 
@@ -185,25 +185,25 @@ Force a fresh login (invalidates any cached session first). Returns:
 }}
 ```
 
-#### `auth.logout(host)`
+#### `auth_logout(host)`
 
 Invalidate the cached session and best-effort-call DSM logout. Returns the prior session age or null if no session existed.
 
-#### `auth.whoami(host)`
+#### `auth_whoami(host)`
 
 Return the cached session descriptor without forcing a login. Triggers a login if no session exists.
 
-### 5.2 packages.*
+### 5.2 packages_*
 
-#### `packages.list(host)`
+#### `packages_list(host)`
 
 List installed packages. Each item: `id`, `name`, `version`, `status` (`start`/`stop`/`error`), `auto_start`. ContainerManager status is replaced with a `docker_health` boolean derived from `docker info` over SSH (web API alone is unreliable here).
 
-#### `packages.status(host, package_id)`
+#### `packages_status(host, package_id)`
 
 Detail on one package: same fields as `list` plus `install_path`, `last_started_at` (if available), and for ContainerManager `docker_info_summary`.
 
-#### `packages.install(host, package_id, version=None, accept_eula=False)`
+#### `packages_install(host, package_id, version=None, accept_eula=False)`
 
 Install a package. Implementation:
 
@@ -215,13 +215,13 @@ Install a package. Implementation:
 
 Returns the installed version + `method` (`server` or `spk_fallback`).
 
-#### `packages.uninstall(host, package_id)`
+#### `packages_uninstall(host, package_id)`
 
 Uninstall. Idempotent — returns ok if package was already absent.
 
-### 5.3 user_home.*
+### 5.3 user_home_*
 
-#### `user_home.is_enabled(host)`
+#### `user_home_is_enabled(host)`
 
 Cross-checks three signals:
 
@@ -231,7 +231,7 @@ Cross-checks three signals:
 
 Returns `{"enabled": bool, "web_api_says": bool, "synoinfo_says": bool, "symlink_target": str | None}`. If those three disagree, `enabled=False` and a warning is added explaining the inconsistency.
 
-#### `user_home.enable(host, user=None)`
+#### `user_home_enable(host, user=None)`
 
 Apply the DSM 7.3 workaround atomically:
 
@@ -242,15 +242,15 @@ Apply the DSM 7.3 workaround atomically:
 
 On step failure, rolls back: re-restores the old `/var/services/homes` symlink target, leaves synoinfo as-is (writes to it are reversible by re-calling with `enable=false`). Returns per-step status.
 
-#### `user_home.disable(host)`
+#### `user_home_disable(host)`
 
 Web API call only; does NOT delete `/volume*/homes/*` data.
 
-### 5.4 snapshot_replication.*
+### 5.4 snapshot_replication_*
 
 **Read-only in MVP.** Plan creation is out of scope; see §11.
 
-#### `snapshot_replication.list_plans(host)`
+#### `snapshot_replication_list_plans(host)`
 
 Returns all SR plans the host knows about (as source or destination):
 
@@ -265,43 +265,43 @@ Returns all SR plans the host knows about (as source or destination):
 ]}
 ```
 
-#### `snapshot_replication.plan_status(host, plan_id)`
+#### `snapshot_replication_plan_status(host, plan_id)`
 
 Last sync timestamp, current state (`idle`/`syncing`/`error`), lag estimate, error if any.
 
-#### `snapshot_replication.recent_activity(host, limit=20)`
+#### `snapshot_replication_recent_activity(host, limit=20)`
 
 Recent sync events from the `replica.db` activity log (read-only).
 
-### 5.5 shares.*
+### 5.5 shares_*
 
-#### `shares.list(host)`
+#### `shares_list(host)`
 
 Shared folders: name, volume, size, encrypted flag, hidden flag, browsable flag.
 
-#### `shares.create(host, name, volume, **opts)`
+#### `shares_create(host, name, volume, **opts)`
 
 Create a share. `opts` includes `description`, `hidden`, `enable_recycle_bin`, `encrypt`, `encryption_passphrase`, `enable_share_cow`. If `name` is a DSM-reserved name (`music`, `photo`, `video`, `NetBackup`, etc.), surface as `ReservedShareName` with a hint that the folder can still exist as a plain dir for rsync targets but cannot be SMB-exposed via `synoshare`.
 
-#### `shares.get_acl(host, name)`
+#### `shares_get_acl(host, name)`
 
 Decoded ACL: users, groups, permissions (`RW`/`RO`/`NO`), inheritable flag.
 
-#### `shares.get_snapshot_config(host, name)`
+#### `shares_get_snapshot_config(host, name)`
 
 Returns the share's snapshot schedule + retention if Btrfs snapshots are enabled.
 
-### 5.6 raid.*
+### 5.6 raid_*
 
-#### `raid.list_volumes(host)`
+#### `raid_list_volumes(host)`
 
 Volumes with name, filesystem (btrfs/ext4), size, used, free, raid level, encryption state, status (`normal`/`degraded`/`crashed`/`resyncing`).
 
-#### `raid.list_disks(host)`
+#### `raid_list_disks(host)`
 
 Physical disks: slot, model, serial, capacity, smart state (`healthy`/`warning`/`failing`), temperature, role (`hot_spare`/`active`/`unused`).
 
-#### `raid.raid_state(host)`
+#### `raid_state(host)`
 
 Parses `/proc/mdstat` over SSH. For each `md<N>` device returns:
 
@@ -313,45 +313,45 @@ Parses `/proc/mdstat` over SSH. For each `md<N>` device returns:
  "members": [{"disk": "sda3", "state": "U"}, ...]}
 ```
 
-#### `raid.hardware_info(host)`
+#### `raid_hardware_info(host)`
 
 Model, DSM build, serial number, total RAM, CPU model, and full NIC table.
 
-### 5.7 ssh.*
+### 5.7 ssh_*
 
-#### `ssh.get_state(host)`
+#### `ssh_get_state(host)`
 
 SSH service enabled? Current port. List of users with SSH app-permission.
 
-#### `ssh.set_port(host, port)`
+#### `ssh_set_port(host, port)`
 
 Change DSM SSH port via `SYNO.Core.Terminal.set`. Warns about firewall rules and confirms reachability post-change.
 
-#### `ssh.enable_user_ssh(host, user)`
+#### `ssh_enable_user_ssh(host, user)`
 
 Grant SSH app-permission to a user.
 
-#### `ssh.add_authorized_key(host, user, pubkey, comment="")`
+#### `ssh_add_authorized_key(host, user, pubkey, comment="")`
 
 Append the pubkey to `/volume*/homes/<user>/.ssh/authorized_keys`. Idempotent — if the pubkey bytes are already present, returns `ok` with `warnings=["key already present"]`. Implementation uses base64-over-`exec_command` (not SFTP — see DSM SFTP quirk).
 
-Pre-flight: verifies User Home is enabled for that user; if not, refers to `user_home.enable` and refuses.
+Pre-flight: verifies User Home is enabled for that user; if not, refers to `user_home_enable` and refuses.
 
-#### `ssh.list_authorized_keys(host, user)`
+#### `ssh_list_authorized_keys(host, user)`
 
 Returns each key with `type` (ed25519/rsa/...), `fingerprint` (SHA256), `comment`, `position` (line number).
 
-#### `ssh.remove_authorized_key(host, user, fingerprint)`
+#### `ssh_remove_authorized_key(host, user, fingerprint)`
 
 Remove by fingerprint. Returns `removed_count`.
 
-### 5.8 network.*
+### 5.8 network_*
 
-#### `network.list_interfaces(host)`
+#### `network_list_interfaces(host)`
 
 Each interface: name (`eth0`/`bond0`/`docker0`/...), mac, mtu, state (`up`/`down`), speed (Mb/s, null if down), duplex, ip addresses, link partner detail if available.
 
-#### `network.get_interface(host, name)`
+#### `network_get_interface(host, name)`
 
 Full detail for one interface including driver, firmware (if available via ethtool over SSH), and `/sys/class/net/<name>/speed` cross-checked against web API speed.
 
@@ -362,8 +362,8 @@ Full detail for one interface including driver, firmware (if available via ethto
 Config is loaded with this precedence (highest first):
 
 1. Explicit per-tool-call params (rare; mostly for testing).
-2. Environment variables.
-3. Config file (`SYNOLOGY_MCP_CONFIG` env or `~/.config/synology-mcp/config.toml`).
+2. Environment variables (`SYNOLOGY_MCP_<HOST>_<FIELD>` — host name uppercased, dashes/dots replaced with underscores).
+3. Config file (`SYNOLOGY_MCP_CONFIG` env or `~/.config/synology-mcp/config.toml`, XDG-style; falls back to `$XDG_CONFIG_HOME/synology-mcp/config.toml` if `XDG_CONFIG_HOME` is set).
 
 ### Config file schema
 
@@ -379,40 +379,48 @@ connect_timeout = 10
 read_timeout = 30
 
 [hosts.<name>]
-address = "fqdn-or-ip"
-username = "admin"
-password = "..."          # optional; prefer env var
-otp_code = "..."          # only if 2FA enabled and you have a static secret
-ssh_username = "admin"    # defaults to username
-ssh_key_path = "~/.ssh/id_ed25519"
-ssh_port = 22
+ip = "fqdn-or-ip"          # alias: `host` or `address`
+account = "admin"          # DSM login name (alias: `username`)
+password = "..."           # optional; prefer env var
+otp_code = "..."           # only if 2FA enabled and you have a static secret
+ssh_username = "admin"     # defaults to account
+ssh_key_path = "~/.ssh/id_ed25519"  # optional; password-only auth supported
+ssh_port = 22              # default 22; override per host if non-standard (e.g. 22334)
 port = 5001
 use_https = true
 verify_tls = true
 ```
 
+`ip`, `host`, and `address` are accepted interchangeably for the connection target. `account` is the DSM login name; `username` is accepted as an alias.
+
 ### Environment variables
 
-Per-host overrides use uppercased + underscored host names:
+Per-host overrides use uppercased + underscored host names. For a host called `cs3`, the lookup keys are:
 
 ```
-SYNOLOGY_MCP_<HOST>_ADDRESS
-SYNOLOGY_MCP_<HOST>_USERNAME
-SYNOLOGY_MCP_<HOST>_PASSWORD
-SYNOLOGY_MCP_<HOST>_OTP_CODE
-SYNOLOGY_MCP_<HOST>_SSH_PORT
-SYNOLOGY_MCP_<HOST>_VERIFY_TLS
+SYNOLOGY_MCP_CS3_IP            # alias: ..._HOST, ..._ADDRESS
+SYNOLOGY_MCP_CS3_ACCOUNT       # alias: ..._USERNAME
+SYNOLOGY_MCP_CS3_PASSWORD
+SYNOLOGY_MCP_CS3_OTP_CODE
+SYNOLOGY_MCP_CS3_SSH_PORT
+SYNOLOGY_MCP_CS3_SSH_USERNAME
+SYNOLOGY_MCP_CS3_SSH_KEY_PATH
+SYNOLOGY_MCP_CS3_VERIFY_TLS
+SYNOLOGY_MCP_CS3_PORT
+SYNOLOGY_MCP_CS3_USE_HTTPS
 ```
+
+Env-var precedence: per-host env vars override config-file values for the same host. Host names with dashes, dots, or other non-alphanumeric characters are normalized to underscores (`nas-primary` → `SYNOLOGY_MCP_NAS_PRIMARY_*`).
 
 Global overrides:
 
 ```
-SYNOLOGY_MCP_CONFIG          # path to config file
+SYNOLOGY_MCP_CONFIG          # path to config file (overrides default location)
 SYNOLOGY_MCP_LOG_LEVEL       # DEBUG/INFO/WARNING/ERROR
 SYNOLOGY_MCP_LIVE_HOST       # used by tests only
 ```
 
-A host with `address` but no `password` will fail tool calls with `ConfigError: password not provided`.
+A host with `ip` but no `password` (and no `ssh_key_path` for SSH-only tools) will fail tool calls with `ConfigError: password not provided`.
 
 ---
 
@@ -420,35 +428,35 @@ A host with `address` but no `password` will fail tool calls with `ConfigError: 
 
 | MCP tool | DSM web API / SSH source |
 |----------|--------------------------|
-| `auth.login` | `SYNO.API.Auth` v6 `login` with `enable_syno_token=yes`, `format=cookie` |
-| `auth.logout` | `SYNO.API.Auth` v6 `logout` |
-| `auth.whoami` | session cache (no DSM call unless cache miss) |
-| `packages.list` | `SYNO.Core.Package` v2 `list` + per-pkg `get` |
-| `packages.status` | `SYNO.Core.Package` v2 `get` + (ContainerManager only) `docker info` over SSH |
-| `packages.install` | primary: `SYNO.Core.Package.Installation` `install_from_server`; fallback: `download` then `install` |
-| `packages.uninstall` | `SYNO.Core.Package.Uninstallation` `uninstall` |
-| `user_home.is_enabled` | `SYNO.Core.User.Home` `get` + SSH `synogetkeyvalue /etc/synoinfo.conf userHomeEnable` + `readlink /var/services/homes` |
-| `user_home.enable` | SSH `synosetkeyvalue` + SSH `ln -s` + `SYNO.Core.User.Home` `set` + SSH `synouserhome --prepare-folder` |
-| `user_home.disable` | `SYNO.Core.User.Home` `set enable_user_home=false` |
-| `snapshot_replication.list_plans` | `SYNO.DR.Plan` `list` + `SYNO.Replica.Share` `list` |
-| `snapshot_replication.plan_status` | `SYNO.DR.Plan` `get` |
-| `snapshot_replication.recent_activity` | `SYNO.DR.Plan` `list_activity` (read-only) |
-| `shares.list` | `SYNO.Core.Share` `list` |
-| `shares.create` | `SYNO.Core.Share` `create` |
-| `shares.get_acl` | `SYNO.Core.Share.Permission` `list` (decoded) |
-| `shares.get_snapshot_config` | `SYNO.Core.Share.Snapshot` `get_config` |
-| `raid.list_volumes` | `SYNO.Storage.CGI.Volume` `list` |
-| `raid.list_disks` | `SYNO.Storage.CGI.HddMan` `enumerate` |
-| `raid.raid_state` | SSH `cat /proc/mdstat` (parsed) |
-| `raid.hardware_info` | `SYNO.Core.System.Info` `get` + `SYNO.Core.System.Utilization` for RAM total |
-| `ssh.get_state` | `SYNO.Core.Terminal` `get` + `SYNO.Core.Group.Member` for SSH group |
-| `ssh.set_port` | `SYNO.Core.Terminal` `set` |
-| `ssh.enable_user_ssh` | `SYNO.Core.Group.Member` add to `administrators`-equivalent or per-app permission |
-| `ssh.add_authorized_key` | SSH `printf %s '<b64>' | base64 -d >> ~/.ssh/authorized_keys` (NO SFTP — see §10) |
-| `ssh.list_authorized_keys` | SSH `cat ~/.ssh/authorized_keys` + parsing |
-| `ssh.remove_authorized_key` | SSH read + filter + write (atomic via `mv tmp final`) |
-| `network.list_interfaces` | `SYNO.Core.Network.Interface` `list` + SSH `cat /sys/class/net/*/{address,speed,operstate,mtu}` |
-| `network.get_interface` | same plus `ethtool` over SSH |
+| `auth_login` | `SYNO.API.Auth` v6 `login` with `enable_syno_token=yes`, `format=cookie` |
+| `auth_logout` | `SYNO.API.Auth` v6 `logout` |
+| `auth_whoami` | session cache (no DSM call unless cache miss) |
+| `packages_list` | `SYNO.Core.Package` v2 `list` + per-pkg `get` |
+| `packages_status` | `SYNO.Core.Package` v2 `get` + (ContainerManager only) `docker info` over SSH |
+| `packages_install` | primary: `SYNO.Core.Package.Installation` `install_from_server`; fallback: `download` then `install` |
+| `packages_uninstall` | `SYNO.Core.Package.Uninstallation` `uninstall` |
+| `user_home_is_enabled` | `SYNO.Core.User.Home` `get` + SSH `synogetkeyvalue /etc/synoinfo.conf userHomeEnable` + `readlink /var/services/homes` |
+| `user_home_enable` | SSH `synosetkeyvalue` + SSH `ln -s` + `SYNO.Core.User.Home` `set` + SSH `synouserhome --prepare-folder` |
+| `user_home_disable` | `SYNO.Core.User.Home` `set enable_user_home=false` |
+| `snapshot_replication_list_plans` | `SYNO.DR.Plan` `list` + `SYNO.Replica.Share` `list` |
+| `snapshot_replication_plan_status` | `SYNO.DR.Plan` `get` |
+| `snapshot_replication_recent_activity` | `SYNO.DR.Plan` `list_activity` (read-only) |
+| `shares_list` | `SYNO.Core.Share` `list` |
+| `shares_create` | `SYNO.Core.Share` `create` |
+| `shares_get_acl` | `SYNO.Core.Share.Permission` `list` (decoded) |
+| `shares_get_snapshot_config` | `SYNO.Core.Share.Snapshot` `get_config` |
+| `raid_list_volumes` | `SYNO.Storage.CGI.Volume` `list` |
+| `raid_list_disks` | `SYNO.Storage.CGI.HddMan` `enumerate` |
+| `raid_state` | SSH `cat /proc/mdstat` (parsed) |
+| `raid_hardware_info` | `SYNO.Core.System.Info` `get` + `SYNO.Core.System.Utilization` for RAM total |
+| `ssh_get_state` | `SYNO.Core.Terminal` `get` + `SYNO.Core.Group.Member` for SSH group |
+| `ssh_set_port` | `SYNO.Core.Terminal` `set` |
+| `ssh_enable_user_ssh` | `SYNO.Core.Group.Member` add to `administrators`-equivalent or per-app permission |
+| `ssh_add_authorized_key` | SSH `printf %s '<b64>' | base64 -d >> ~/.ssh/authorized_keys` (NO SFTP — see §10) |
+| `ssh_list_authorized_keys` | SSH `cat ~/.ssh/authorized_keys` + parsing |
+| `ssh_remove_authorized_key` | SSH read + filter + write (atomic via `mv tmp final`) |
+| `network_list_interfaces` | `SYNO.Core.Network.Interface` `list` + SSH `cat /sys/class/net/*/{address,speed,operstate,mtu}` |
+| `network_get_interface` | same plus `ethtool` over SSH |
 
 ---
 
@@ -562,7 +570,7 @@ These are deliberately deferred. Adding them later is straightforward — they'r
 
 **Why deferred:** DSM's SR plan creation is gated by a one-shot UI node-pairing wizard. Even with manual schedule + "skip initial sync", DSM by default kicks off a baseline send on plan creation, and there is no documented API flag to disable that. The plan creator writes a multi-table record to `/var/packages/SnapshotReplication/etc/replica.db` (tables: `plan`, `share_replication`, `sync_info`, `remote_conn`, `output_conn`). Creating these blind via undocumented `SYNO.DR.Plan` / `SYNO.Replica.Share` endpoints risks half-built rows that DSM UI cannot remediate. Until we capture the exact UI request shape from a recorded browser session, this is too risky to ship.
 
-**Path to support:** capture the request payload from DSM's UI on plan creation, validate against multiple DSM versions, then implement as a single `snapshot_replication.create_plan(host, source_share, dest_host, dest_share, **opts)` tool with the same idempotency + rollback discipline as `user_home.enable`.
+**Path to support:** capture the request payload from DSM's UI on plan creation, validate against multiple DSM versions, then implement as a single `snapshot_replication_create_plan(host, source_share, dest_host, dest_share, **opts)` tool with the same idempotency + rollback discipline as `user_home_enable`.
 
 ### Encryption key management
 
@@ -586,11 +594,14 @@ Querying available packages in Synology's repos before install. Deferred — ins
 
 ---
 
-## Open design questions
+## Resolved design decisions
 
-Not blocking the scaffold but worth deciding before implementation lands:
+Resolved 2026-05-26 before Phase 1 implementation:
 
-1. **Connection pooling lifetime.** Idle httpx clients hold sockets indefinitely. Should we close after N minutes of idle? Probably yes; 5 min default, configurable.
-2. **SSH connection reuse vs. fresh-each-call.** Reuse is faster but failure modes are murkier (stale channel, broken pipe). Likely reuse with explicit "reconnect on error" + a per-host max-idle.
-3. **How aggressively to surface DSM warning fields.** DSM often returns `success=true` with a `warning` substring; do we add those to the tool's `warnings` list verbatim or normalize them? Lean toward verbatim for v0.
-4. **MCP tool naming style.** This doc uses `module.tool` style. The MCP spec allows arbitrary names; we just need consistency. Could also do `synology_packages_install` etc. Slight preference for `module.tool` for IDE auto-suggest; will lock in before first release.
+1. **Config file path.** `~/.config/synology-mcp/config.toml` (XDG-ish; honours `$XDG_CONFIG_HOME` when set). Override with `SYNOLOGY_MCP_CONFIG` env var.
+2. **MCP tool naming style.** Flat snake_case with module prefix (`auth_login`, `raid_list_volumes`). No dots. MCP clients see one flat tool namespace, which plays best with current Claude Code / Claude Desktop tool autocomplete.
+3. **httpx client lifecycle.** One `httpx.AsyncClient` cached per host for the lifetime of the MCP process. No idle timer. Reconnect only on auth error (DSM 105/107/119) or transport-level socket error. Rationale: an idle httpx client costs ~zero, and DSM does not punish long-lived connections.
+4. **paramiko SSH client lifecycle.** One `SSHClient` cached per host for the lifetime of the process. `transport.set_keepalive(60)` to survive Synology's ~10-15 min idle-disconnect. Channel errors trigger a transparent reconnect; the caller never sees stale-channel failures.
+5. **DSM warning surfacing.** Verbatim pass-through. Whatever string DSM returns in a `success=true` envelope with a `warning` field (or in the top-level `error.errors` payload on warning-class errors) is appended to the tool's `warnings[]` list with no normalization. Operators see DSM's exact words.
+
+These decisions are locked. Future revisits should treat them as load-bearing for downstream consumers.
