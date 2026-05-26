@@ -1,0 +1,6 @@
+# Canonical DSM response JSON for replay tests.
+# Each fixture lives in a subdirectory named for its DSM API:
+#   tests/fixtures/SYNO.API.Auth/login_v6_ok.json
+#   tests/fixtures/SYNO.API.Auth/login_v6_otp_required.json
+#   tests/fixtures/SYNO.Core.Package/list_ok.json
+# ...etc. Capture with `respx --record` or by hand from the browser network tab.

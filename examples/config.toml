@@ -1,0 +1,48 @@
+# synology-mcp configuration
+#
+# Default location: ~/.config/synology-mcp/config.toml
+# Override with the SYNOLOGY_MCP_CONFIG env var (absolute path).
+#
+# Every host you want to manage gets a [hosts.<name>] table. The <name> is
+# what you pass as `host` to MCP tool calls (it can be the FQDN, an IP, or
+# any nickname — it just has to match consistently).
+#
+# Credentials can ALSO be supplied via environment variables. Precedence:
+#   1. Per-tool-call params (if explicitly passed)
+#   2. Env vars (see schema in DESIGN.md §6)
+#   3. Config file (this file)
+#
+# Never commit a real config file with credentials. Use `config.local.toml`
+# (gitignored) or env vars in production.
+
+[defaults]
+# Applied to all hosts unless overridden in the [hosts.<name>] table.
+port = 5001          # HTTPS DSM web port
+use_https = true
+verify_tls = true    # Set false ONLY for self-signed certs on trusted LANs
+ssh_port = 22        # Override per-host if DSM SSH is on a non-default port
+connect_timeout = 10
+read_timeout = 30
+
+[hosts.nas-primary]
+address = "nas-primary.example.com"
+username = "admin"
+# password = "..."           # Prefer env var SYNOLOGY_MCP_NAS_PRIMARY_PASS
+# otp_code = "..."           # Only if 2FA is on; usually fetched dynamically
+# ssh_username = "admin"     # Defaults to `username` if omitted
+# ssh_key_path = "~/.ssh/id_ed25519"
+# ssh_port = 22334           # Override defaults.ssh_port if your DSM SSH is non-standard
+# verify_tls = false         # Override per host for self-signed certs
+
+[hosts.nas-backup]
+address = "10.0.0.20"
+username = "admin"
+ssh_port = 22334
+verify_tls = false           # Self-signed cert
+# password sourced from SYNOLOGY_MCP_NAS_BACKUP_PASS env var
+
+# [hosts.nas-offsite]
+# address = "backup.example.org"
+# username = "backupuser"
+# port = 5001
+# verify_tls = true

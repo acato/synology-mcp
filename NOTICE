@@ -1,0 +1,21 @@
+synology-mcp
+Copyright 2026 synology-mcp contributors
+
+This product includes software developed by the synology-mcp project
+contributors (https://github.com/acato/synology-mcp).
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+---
+
+This project is an independent integration of the Synology DSM web API.
+It is not affiliated with, endorsed by, or sponsored by Synology Inc.
+"Synology" and "DSM" are trademarks of Synology Inc.
+
+---
+
+Third-party dependencies:
+  - mcp (Anthropic Model Context Protocol SDK, MIT)
+  - httpx (BSD-3-Clause)
+  - paramiko (LGPL-2.1)
+  - pydantic (MIT)

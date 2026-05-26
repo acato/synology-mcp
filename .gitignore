@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+.installed.cfg
+
+# uv
+.venv/
+uv.lock
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# ruff
+.ruff_cache/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Secrets / local config
+*.env
+.env.*
+!.env.example
+config.local.*
+.secrets/
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+
+# Project-local
+/tmp/
+/scratch/
+*.log
