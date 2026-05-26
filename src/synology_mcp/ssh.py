@@ -21,22 +21,22 @@ Key DSM quirks handled here:
 from __future__ import annotations
 
 
-async def get_ssh_state(host: str) -> dict:  # noqa: ARG001
+async def get_ssh_state(host: str) -> dict:
     """TODO: ssh service enabled? port? per-user app-permissions state?"""
     raise NotImplementedError
 
 
-async def set_ssh_port(host: str, port: int) -> dict:  # noqa: ARG001
+async def set_ssh_port(host: str, port: int) -> dict:
     """TODO: change DSM SSH port via SYNO.Core.Terminal. Warns about firewall."""
     raise NotImplementedError
 
 
-async def enable_user_ssh(host: str, user: str) -> dict:  # noqa: ARG001
+async def enable_user_ssh(host: str, user: str) -> dict:
     """TODO: grant SSH app-permission to `user`."""
     raise NotImplementedError
 
 
-async def add_authorized_key(host: str, user: str, pubkey: str, comment: str = "") -> dict:  # noqa: ARG001
+async def add_authorized_key(host: str, user: str, pubkey: str, comment: str = "") -> dict:
     """TODO: append pubkey to /volume*/homes/<user>/.ssh/authorized_keys.
 
     Idempotent (skip if pubkey bytes already present). Uses base64-over-exec
@@ -46,11 +46,11 @@ async def add_authorized_key(host: str, user: str, pubkey: str, comment: str = "
     raise NotImplementedError
 
 
-async def list_authorized_keys(host: str, user: str) -> dict:  # noqa: ARG001
+async def list_authorized_keys(host: str, user: str) -> dict:
     """TODO: list authorized keys with comment, key type, fingerprint."""
     raise NotImplementedError
 
 
-async def remove_authorized_key(host: str, user: str, fingerprint: str) -> dict:  # noqa: ARG001
+async def remove_authorized_key(host: str, user: str, fingerprint: str) -> dict:
     """TODO: remove a key by SHA256 fingerprint."""
     raise NotImplementedError

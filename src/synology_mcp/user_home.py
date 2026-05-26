@@ -19,7 +19,7 @@ Key DSM quirks handled here:
 from __future__ import annotations
 
 
-async def is_enabled(host: str) -> dict:  # noqa: ARG001
+async def is_enabled(host: str) -> dict:
     """TODO: query current state; do NOT trust web API alone.
 
     Cross-checks `/etc/synoinfo.conf userHomeEnable` value AND
@@ -28,7 +28,7 @@ async def is_enabled(host: str) -> dict:  # noqa: ARG001
     raise NotImplementedError
 
 
-async def enable(host: str, user: str | None = None) -> dict:  # noqa: ARG001
+async def enable(host: str, user: str | None = None) -> dict:
     """TODO: apply the synoinfo.conf workaround + retarget + prepare-folder.
 
     Requires SSH with sudo. Atomically reports each step; rolls back symlink
@@ -37,6 +37,6 @@ async def enable(host: str, user: str | None = None) -> dict:  # noqa: ARG001
     raise NotImplementedError
 
 
-async def disable(host: str) -> dict:  # noqa: ARG001
+async def disable(host: str) -> dict:
     """TODO: turn off User Home via web API; does NOT remove `/volume*/homes/*`."""
     raise NotImplementedError

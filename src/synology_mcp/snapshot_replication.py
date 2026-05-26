@@ -13,16 +13,16 @@ remediate. See DESIGN.md §11.
 from __future__ import annotations
 
 
-async def list_plans(host: str) -> dict:  # noqa: ARG001
+async def list_plans(host: str) -> dict:
     """TODO: list all SR plans (source-side and destination-side roles)."""
     raise NotImplementedError
 
 
-async def get_plan_status(host: str, plan_id: str) -> dict:  # noqa: ARG001
+async def get_plan_status(host: str, plan_id: str) -> dict:
     """TODO: detailed status: last sync time, lag, retention, schedule."""
     raise NotImplementedError
 
 
-async def get_recent_activity(host: str, limit: int = 20) -> dict:  # noqa: ARG001
+async def get_recent_activity(host: str, limit: int = 20) -> dict:
     """TODO: recent SR sync events from `replica.db` activity log."""
     raise NotImplementedError

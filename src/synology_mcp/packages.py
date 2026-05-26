@@ -16,17 +16,17 @@ Key DSM quirks handled here:
 from __future__ import annotations
 
 
-async def list_packages(host: str) -> dict:  # noqa: ARG001
+async def list_packages(host: str) -> dict:
     """TODO: list installed packages with version + status."""
     raise NotImplementedError
 
 
-async def get_package_status(host: str, package_id: str) -> dict:  # noqa: ARG001
+async def get_package_status(host: str, package_id: str) -> dict:
     """TODO: status of one package; applies ContainerManager workaround."""
     raise NotImplementedError
 
 
-async def install_package(host: str, package_id: str, version: str | None = None) -> dict:  # noqa: ARG001
+async def install_package(host: str, package_id: str, version: str | None = None) -> dict:
     """TODO: install with `install_from_server`, fall back to `.spk` upload.
 
     See DESIGN.md §5.2 for full signature + error model.
@@ -34,6 +34,6 @@ async def install_package(host: str, package_id: str, version: str | None = None
     raise NotImplementedError
 
 
-async def uninstall_package(host: str, package_id: str) -> dict:  # noqa: ARG001
+async def uninstall_package(host: str, package_id: str) -> dict:
     """TODO: uninstall and confirm via package list."""
     raise NotImplementedError

@@ -15,21 +15,21 @@ Key DSM quirks handled here:
 from __future__ import annotations
 
 
-async def list_shares(host: str) -> dict:  # noqa: ARG001
+async def list_shares(host: str) -> dict:
     """TODO: list shared folders with volume, size, encrypted flag."""
     raise NotImplementedError
 
 
-async def create_share(host: str, name: str, volume: str, **opts: object) -> dict:  # noqa: ARG001
+async def create_share(host: str, name: str, volume: str, **opts: object) -> dict:
     """TODO: create a share. Surfaces reserved-name conflicts explicitly."""
     raise NotImplementedError
 
 
-async def get_share_acl(host: str, name: str) -> dict:  # noqa: ARG001
+async def get_share_acl(host: str, name: str) -> dict:
     """TODO: read share ACL (users, groups, permissions). Decoded view."""
     raise NotImplementedError
 
 
-async def get_share_snapshot_config(host: str, name: str) -> dict:  # noqa: ARG001
+async def get_share_snapshot_config(host: str, name: str) -> dict:
     """TODO: read snapshot retention/schedule for a share."""
     raise NotImplementedError
