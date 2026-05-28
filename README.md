@@ -60,6 +60,24 @@ uv sync
 uv run synology-mcp
 ```
 
+### Windows: avoid Microsoft Store Python
+
+If `uv` picks Microsoft Store Python (path under `\WindowsApps\PythonSoftwareFoundation...`) when creating the venv, the MCP runs fine from a terminal but fails to launch from GUI hosts like the Claude desktop app, IDE extensions, or scheduled tasks. You will see:
+
+```
+Unable to create process using "...\WindowsApps\PythonSoftwareFoundation.Python.3.12_...\python.exe"
+```
+
+The Store-Python app-execution alias requires an interactive user context that GUI-spawned children do not get. Pin `uv` to a non-Store interpreter — uv's managed Python is easiest:
+
+```powershell
+uv python install 3.12
+uv venv --python 3.12 --python-preference only-managed --clear
+uv sync
+```
+
+Verify: `Get-Content .venv\pyvenv.cfg` — the `home =` line should point under `AppData\Roaming\uv\python\...`, **not** `\WindowsApps\`. A python.org installer or `winget install Python.Python.3.12` also works.
+
 ### Wire into Claude Code
 
 ```bash
